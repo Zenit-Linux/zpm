@@ -1,18 +1,3 @@
-## zpm.nim — Zenith Package Manager
-## ============================================================
-## Punkt wejścia. Zachowanie całego programu zależy od tego, jak
-## zostanie skompilowany:
-##
-##   nim c zpm.nim                → TRYB STANDARDOWY (orkiestrator hosta)
-##   nim c -d:atomic zpm.nim      → TRYB ATOMOWY (strażnik kontenerów)
-##
-## Flaga uruchomieniowa --building przełącza Tryb Standardowy w tryb
-## budowania obrazów (instalacja do --root=<ścieżka> zamiast na hosta).
-##
-## Ten sam kod źródłowy, dwa całkowicie różne programy — zgodnie z
-## założeniem, że Zenith Linux buduje samego siebie tym samym narzędziem,
-## którego używa jego użytkownik końcowy.
-
 import std/[os, parseopt, strutils, strformat]
 import ./zpmpkg/types
 import ./zpmpkg/config
