@@ -1,12 +1,13 @@
 version       = "0.1.0-proto"
-author        = "Zenith Linux Project"
+author        = "Zenith Linux Developers"
 description   = "Zenith Package Manager (zpm) — inteligentny orkiestrator pakietów dla Zenith Linux"
-license       = "MIT"
+license       = "Apache-2.0"
 srcDir        = "src"
 bin           = @["zpm"]
 binDir        = "bin"
 
 requires "nim >= 1.6.0"
+requires "db_connector >= 0.1.0"
 
 # --- Zadania pomocnicze -----------------------------------------------
 
