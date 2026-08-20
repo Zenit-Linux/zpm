@@ -1,1 +1,48 @@
-
+{
+    "tools": [
+        {
+            "name": "cr",
+            "bin": ""
+        },
+        {
+            "name": "about",
+            "bin": ""
+        },
+        {
+            "name": "gr",
+            "bin": ""
+        },
+        {
+            "name": "mk",
+            "bin": ""
+        },
+        {
+            "name": "ow",
+            "bin": ""
+        },
+        {
+            "name": "pm",
+            "bin": ""
+        },
+        {
+            "name": "rm",
+            "bin": ""
+        },
+        {
+            "name": "zesh",
+            "bin": ""
+        },
+        {
+            "name": "dl",
+            "bin": ""
+        },
+        {
+            "name": "kernel",
+            "bin": ""
+        },
+        {
+            "name": "installer",
+            "bin": ""
+        }
+    ]
+}
