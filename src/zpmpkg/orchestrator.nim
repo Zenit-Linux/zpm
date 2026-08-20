@@ -1,5 +1,5 @@
 import std/[strformat, strutils, threadpool, os, algorithm]
-import std/db_sqlite
+import db_connector/db_sqlite
 import ./types
 import ./config
 import ./database
