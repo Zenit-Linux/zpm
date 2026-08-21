@@ -38,7 +38,7 @@
         },
         {
             "name": "kernel",
-            "bin": ""
+            "bin": "https://github.com/Zenith-Linux/kernel.git"
             "info": "kernel, build from source"
         },
         {
@@ -49,6 +49,10 @@
         {
             "name": "installer",
             "bin": ""
+        },
+        {
+            "name": "zlb"
+            "bin": "https://github.com/Zenith-Linux/zlb/releases/download/v0.1/zlb"
         }
     ]
 }
