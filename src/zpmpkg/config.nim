@@ -4,7 +4,7 @@ import ./types
 
 const DefaultConfigPath* = "/etc/zpm/config.hcl"
 
-proc backendFromStr(s: string): BackendKind =
+proc backendFromStr*(s: string): BackendKind =
   case s.toLowerAscii()
   of "apt": bkApt
   of "dnf": bkDnf
@@ -15,18 +15,23 @@ proc backendFromStr(s: string): BackendKind =
   of "cargo": bkCargo
   of "pip": bkPip
   of "npm": bkNpm
+  of "brew": bkBrew
+  of "own": bkOwn
   of "zenith": bkZenithNat
   else: bkApt  # bezpieczny fallback, walidowany wyżej
 
 proc defaultConfig*(): ZpmConfig =
   ZpmConfig(
     dbPath: "/var/lib/zpm/zpm.db",
-    enabledBackends: @[bkApt, bkDnf, bkPacman, bkZypper, bkFlatpak, bkSnap, bkCargo, bkPip, bkNpm],
+    enabledBackends: @[bkApt, bkDnf, bkPacman, bkZypper, bkFlatpak, bkSnap, bkCargo, bkPip, bkNpm, bkBrew, bkOwn],
     parallelUpdates: true,
     confirmBeforeInstall: true,
-    preferredOrder: @[bkFlatpak, bkApt, bkDnf, bkPacman, bkZypper, bkSnap, bkCargo, bkPip, bkNpm],
+    preferredOrder: @[bkOwn, bkFlatpak, bkApt, bkDnf, bkPacman, bkZypper, bkSnap, bkBrew, bkCargo, bkPip, bkNpm],
     atomicStorePath: "/var/lib/zpm/atomic",
-    buildingCacheDir: "/var/cache/zpm/building"
+    buildingCacheDir: "/var/cache/zpm/building",
+    customRepoPath: "/etc/zpm/custom/own-repository.json",
+    ownToolsInstallDir: "/usr/local/bin",
+    defaultBuildingBackend: "apt"
   )
 
 proc loadConfig*(path: string = DefaultConfigPath): ZpmConfig =
@@ -65,3 +70,10 @@ proc loadConfig*(path: string = DefaultConfigPath): ZpmConfig =
   let building = root.findBlock("building")
   if building != nil:
     result.buildingCacheDir = building.getStr("cache_dir", result.buildingCacheDir)
+    result.defaultBuildingBackend = building.getStr("default_backend", result.defaultBuildingBackend)
+
+  # ---- custom { } -- własny ekosystem Zenith -----------------------------
+  let custom = root.findBlock("custom")
+  if custom != nil:
+    result.customRepoPath = custom.getStr("repository_path", result.customRepoPath)
+    result.ownToolsInstallDir = custom.getStr("install_dir", result.ownToolsInstallDir)
