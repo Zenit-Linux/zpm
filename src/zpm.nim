@@ -2,6 +2,7 @@ import std/[os, parseopt, strutils, strformat]
 import ./zpmpkg/types
 import ./zpmpkg/config
 import ./zpmpkg/database
+import ./zpmpkg/ownrepo
 
 when defined(atomic):
   import ./zpmpkg/atomic
@@ -31,17 +32,28 @@ proc printHelp() =
     echo "Konfiguracja: /etc/zpm/config.hcl (sekcja `atomic { store_path = ... }`)"
   else:
     echo "Użycie:"
-    echo "  zpm install <pakiet> [-y]        Szuka i instaluje pakiet ze wszystkich backendów"
-    echo "  zpm remove  <pakiet>             Usuwa pakiet śledzony przez zpm"
-    echo "  zpm update                       Aktualizuje wszystkie rejestry (równolegle) i sprząta"
+    echo "  zpm install <pakiet...> [-y]     Szuka i instaluje 1+ pakietów ze wszystkich backendów"
+    echo "                                   (\"pakiet -> backend\" / \"pakiet@backend\" wymusza backend)"
+    echo "  zpm remove  <pakiet...>          Usuwa 1+ pakiet(ów) śledzonych przez zpm"
+    echo "  zpm update | upgrade             Aktualizuje wszystkie rejestry (równolegle) i sprząta"
+    echo "  zpm sync                         Alias `update` (zgodny z wywołaniami zlb)"
     echo "  zpm list                         Listuje pakiety zainstalowane przez zpm"
+    echo "  zpm own list                     Listuje narzędzia z custom/own-repository.json"
+    echo "  zpm init                          Inicjalizuje bazę hosta (patrz --trust-keys)"
+    echo ""
+    echo "  Tryb budowania obrazów (rootfs dla zlb, nigdy nie dotyka hosta):"
+    echo "  zpm --root=<ścieżka> [--backend=apt|dnf|pacman|zypper|brew|own] init [--trust-keys=<plik>]"
+    echo "  zpm --root=<ścieżka> [--backend=...] install <pkg...>"
+    echo "  zpm --root=<ścieżka> [--backend=...] remove  <pkg...>"
+    echo "  zpm --root=<ścieżka> sync"
     echo "  zpm --building --root=<ścieżka> --backend=<apt|dnf|pacman|zypper> install <pkg...>"
-    echo "                                   Instaluje pakiety do obrazu / rootfsu, NIE na hosta"
+    echo "                                   (forma zgodności wstecznej dla powyższego)"
     echo ""
     echo "Flagi globalne:"
     echo "  -y, --yes           nie pytaj, wybierz automatycznie najlepszego kandydata"
     echo "  -c, --config=ŚCIEŻKA użyj innego pliku konfiguracyjnego niż /etc/zpm/config.hcl"
     echo "      --user-db        użyj lokalnej bazy w $HOME/.local/share/zpm/zpm.db zamiast /var/lib/zpm"
+    echo "      --trust-keys=P   (z `init`) zaufaj zestawowi kluczy repo z pliku P"
     echo "  -h, --help           pokaż tę pomoc"
     echo "  -v, --version        pokaż wersję"
     echo ""
@@ -99,8 +111,9 @@ else:
     var useUserDb = false
     var buildingMode = false
     var buildRoot = ""
-    var buildBackend = "apt"
+    var buildBackend = ""
     var assumeYes = false
+    var trustKeys = ""
     var positional: seq[string] = @[]
 
     var p = initOptParser(commandLineParams())
@@ -118,22 +131,51 @@ else:
         of "building": buildingMode = true
         of "root": buildRoot = val
         of "backend": buildBackend = val
+        of "trust-keys": trustKeys = val
         else: discard
       of cmdEnd: discard
 
     let cfg = loadConfig(configPath)
 
+    # `--root` implicitly puts zpm into building mode, matching the
+    # ergonomic `zlb` uses: `zpm --root <rootfs> <cmd> ...` -- never
+    # touches the host database, mirrors `--building --root=...`.
+    if buildRoot.len > 0:
+      buildingMode = true
+
     if buildingMode:
-      # Tryb budowania obrazów — nie dotyka bazy hosta, nie pyta interaktywnie.
-      if positional.len < 2 or positional[0] != "install":
-        echo "[zpm --building] Użycie: zpm --building --root=<ścieżka> --backend=<apt|dnf|pacman|zypper> install <pkg...>"
+      if positional.len == 0:
+        echo "[zpm --building] Użycie: zpm --root=<ścieżka> [--backend=...] <init|install|remove|sync> [pkg...]"
         quit(1)
-      let packages = positional[1..^1]
-      runBuilding(cfg, buildRoot, buildBackend, packages)
+      case positional[0]
+      of "init":
+        runBuildingInit(cfg, buildRoot, trustKeys)
+      of "install":
+        if positional.len < 2:
+          echo "[zpm --building] Użycie: zpm --root=<ścieżka> install <pkg...>"
+          quit(1)
+        runBuilding(cfg, buildRoot, buildBackend, positional[1..^1])
+      of "remove", "uninstall":
+        runBuildingRemove(cfg, buildRoot, buildBackend, positional[1..^1])
+      of "sync":
+        runBuildingSync(cfg, buildRoot)
+      else:
+        echo &"[zpm --building] Nieznana komenda: {positional[0]}"
+        quit(1)
       return
 
     if positional.len == 0:
       printHelp()
+      return
+
+    # `zpm own <list>` -- inspekcja ekosystemu Zenith bez dotykania hosta.
+    if positional[0] == "own":
+      let repo = loadOwnRepository(cfg.customRepoPath)
+      listOwn(repo)
+      return
+
+    if positional[0] == "init":
+      cmdInit(cfg, trustKeys)
       return
 
     let dbPath = if useUserDb: userDbPath() else: cfg.dbPath
@@ -143,16 +185,18 @@ else:
     case positional[0]
     of "install":
       if positional.len < 2:
-        echo "[zpm] Użycie: zpm install <pakiet> [-y]"
+        echo "[zpm] Użycie: zpm install <pakiet...> [-y]"
         return
-      cmdInstall(cfg, db, positional[1], assumeYes)
+      cmdInstall(cfg, db, positional[1..^1], assumeYes)
     of "remove", "uninstall":
       if positional.len < 2:
-        echo "[zpm] Użycie: zpm remove <pakiet>"
+        echo "[zpm] Użycie: zpm remove <pakiet...>"
         return
-      cmdRemove(cfg, db, positional[1])
+      cmdRemove(cfg, db, positional[1..^1])
     of "update", "upgrade":
       cmdUpdate(cfg)
+    of "sync":
+      cmdSync(cfg)
     of "list":
       cmdList(db)
     else:
