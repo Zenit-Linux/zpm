@@ -1,6 +1,6 @@
 version       = "0.1.0-proto"
-author        = "Zenith Linux Developers"
-description   = "Zenith Package Manager (zpm) — inteligentny orkiestrator pakietów dla Zenith Linux"
+author        = "Zenit Linux Developers"
+description   = "Zenit Package Manager (zpm) — inteligentny orkiestrator pakietów dla Zenit Linux"
 license       = "Apache-2.0"
 srcDir        = "src"
 bin           = @["zpm"]
