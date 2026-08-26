@@ -1,4 +1,5 @@
 import std/[osproc, strutils, os, streams]
+import ../logging
 import ../types
 
 proc backendAvailable*(binName: string): bool =
@@ -17,7 +18,7 @@ proc runInteractive*(cmd: string, args: seq[string]): int =
   ## realnej instalacji (sudo apt install, itd.), żeby użytkownik widział
   ## pasek postępu i mógł odpowiadać na pytania [T/n].
   if findExe(cmd).len == 0:
-    echo "[zpm] Brak polecenia '" & cmd & "' w PATH — pomijam tę operację."
+    log("[zpm] Brak polecenia '" & cmd & "' w PATH — pomijam tę operację.")
     return 127
   let p = startProcess(cmd, args = args,
                         options = {poUsePath, poParentStreams})
