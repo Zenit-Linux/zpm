@@ -1,6 +1,7 @@
 import std/[strutils, os]
 import ./common
 import ../types
+import ../logging
 
 ## brew.nim -- backend Homebrew/Linuxbrew.
 ##
@@ -44,10 +45,16 @@ proc search*(query: string): seq[PackageCandidate] =
       installCmd: @[bin, "install", name], extra: "brew"
     ))
 
+proc isInstalled*(name: string): bool =
+  let bin = brewBin()
+  if bin.len == 0: return false
+  let (_, code) = runCapture(bin, @["list", "--versions", name])
+  code == 0
+
 proc install*(name: string): int =
   let bin = brewBin()
   if bin.len == 0:
-    echo "[zpm] Brew nie znaleziony (ani na PATH, ani w typowych lokalizacjach) — pomijam."
+    log("[zpm] Brew nie znaleziony (ani na PATH, ani w typowych lokalizacjach) — pomijam.")
     return 127
   runInteractive(bin, @["install", name])
 
