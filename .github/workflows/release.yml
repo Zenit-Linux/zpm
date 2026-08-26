@@ -1,1 +1,59 @@
+name: Release
 
+# v0.2 -- zpm, podobnie jak zlb, nie miało ŻADNEGO workflow publikującego
+# binarkę do GitHub Releases, mimo że `zlb` (zlbpkg/scaffold.nim,
+# zlbpkg/manifest.nim) domyślnie generuje dla `own-repository.json`
+# wpis "bin" wskazujący dokładnie na
+#   https://github.com/Zenit-Linux/zpm/releases/download/v<wersja>/zpm
+# -- ten URL był więc od początku martwy. Ten workflow, wyzwalany
+# tagiem `vX.Y[.Z]`, buduje wariant STANDARDOWY (ten, którego dotyczy
+# powyższy URL -- `zpm-atomic` publikowany jest jako osobny asset, bo
+# ma inne przeznaczenie i own-repository.json go nie referencuje) i
+# publikuje go pod DOKŁADNIE tą nazwą assetu ("zpm"), żeby istniejący
+## wpis "bin" w repo zadziałał bez dalszych zmian.
+
+on:
+  push:
+    tags:
+      - "v*.*"
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.0"
+
+      - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - run: nimble install -d -y
+
+      - name: Testy jednostkowe (nic nie publikujemy bez zielonych testów)
+        run: nimble test
+
+      - name: Buduje wariant STANDARDOWY (release)
+        run: nimble standard
+
+      - name: Buduje wariant ATOMOWY (release)
+        run: nimble atomic
+
+      - name: Suma sha256 (dla own-repository.json / weryfikacji operatora)
+        run: |
+          sha256sum bin/zpm > bin/zpm.sha256
+          sha256sum bin/zpm-atomic > bin/zpm-atomic.sha256
+
+      - name: Publikuj w GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bin/zpm
+            bin/zpm.sha256
+            bin/zpm-atomic
+            bin/zpm-atomic.sha256
+          generate_release_notes: true
