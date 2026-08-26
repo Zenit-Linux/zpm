@@ -28,6 +28,13 @@ proc install*(name: string): int =
 proc remove*(name: string): int =
   runInteractive("sudo", @["apt", "remove", "-y", name])
 
+proc isInstalled*(name: string): bool =
+  ## v0.2 -- dla `zpm doctor`: sprawdza REALNY stan pakietu na dysku
+  ## (dpkg -s), a nie tylko "czy zpm ma o nim wpis w bazie".
+  if not isPresent(): return false
+  let (output, code) = runCapture("dpkg-query", @["-W", "-f=${Status}", name])
+  code == 0 and "install ok installed" in output
+
 proc updateAll*(): int =
   discard runInteractive("sudo", @["apt", "update"])
   runInteractive("sudo", @["apt", "upgrade", "-y"])
