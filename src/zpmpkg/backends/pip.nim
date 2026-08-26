@@ -18,6 +18,11 @@ proc search*(query: string): seq[PackageCandidate] =
     extra: "pip --user"
   ))
 
+proc isInstalled*(name: string): bool =
+  if not isPresent(): return false
+  let (_, code) = runCapture(pipBin(), @["show", name])
+  code == 0
+
 proc install*(name: string): int =
   runInteractive(pipBin(), @["install", "--user", name])
 
