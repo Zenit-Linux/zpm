@@ -22,6 +22,11 @@ proc search*(query: string): seq[PackageCandidate] =
       installCmd: @["flatpak", "install", "-y", "flathub", appId], extra: "flatpak"
     ))
 
+proc isInstalled*(appId: string): bool =
+  if not isPresent(): return false
+  let (_, code) = runCapture("flatpak", @["info", appId])
+  code == 0
+
 proc install*(appId: string): int =
   runInteractive("flatpak", @["install", "-y", "flathub", appId])
 
