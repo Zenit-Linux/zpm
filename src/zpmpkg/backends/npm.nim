@@ -24,6 +24,16 @@ proc search*(query: string): seq[PackageCandidate] =
   except JsonParsingError:
     discard  # brak wyników / npm nie zwrócił poprawnego JSON
 
+proc isInstalled*(name: string): bool =
+  if not isPresent(): return false
+  let (output, code) = runCapture("npm", @["list", "-g", name, "--depth=0", "--json"])
+  if code != 0: return false
+  try:
+    let data = parseJson(output)
+    data.hasKey("dependencies") and data["dependencies"].hasKey(name)
+  except JsonParsingError:
+    false
+
 proc install*(name: string): int =
   runInteractive("sudo", @["npm", "install", "-g", name])
 
