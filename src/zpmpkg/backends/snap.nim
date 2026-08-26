@@ -25,6 +25,11 @@ proc search*(query: string): seq[PackageCandidate] =
       installCmd: @["sudo", "snap", "install", name], extra: "snap"
     ))
 
+proc isInstalled*(name: string): bool =
+  if not isPresent(): return false
+  let (_, code) = runCapture("snap", @["list", name])
+  code == 0
+
 proc install*(name: string): int =
   runInteractive("sudo", @["snap", "install", name])
 
