@@ -1,0 +1,154 @@
+.\" v0.2 -- zamyka lukę "Strony podręcznika i shell completion -- nie istnieją".
+.\" Format: groff/man(7). Instalacja: kopiuj do /usr/local/share/man/man1/zpm.1
+.\" i uruchom `mandb` (albo dołącz do pakietu .zpk/apt jako część data plików).
+.TH ZPM 1 "2026" "zpm 0.2.0" "Zenit Package Manager"
+.SH NAZWA
+zpm \- Zenit Package Manager: orkiestrator pakietów Zenit Linux (apt/dnf/pacman/zypper/brew/flatpak/snap/cargo/npm/pip + ekosystem "own" + repo natywne)
+.SH SKŁADNIA
+.B zpm
+[\fIFLAGI GLOBALNE\fR] \fIKOMENDA\fR [\fIARGUMENTY\fR...]
+.SH OPIS
+.B zpm
+to jeden punkt wejścia do zarządzania pakietami na Zenit Linux: przeszukuje
+i instaluje z wielu backendów systemowych naraz, zarządza własnym
+ekosystemem narzędzi budowanych ze źródeł lub pobieranych binarnie
+("own"), oraz natywnym formatem pakietów .zpk. Ma dwa tryby budowania:
+.TP
+\fBTryb STANDARDOWY\fR (domyślny)
+Orkiestrator hosta -- instaluje na bieżący, żywy system.
+.TP
+\fBTryb ATOMOWY\fR (\fB-d:atomic\fR w czasie kompilacji)
+Strażnik kontenerów/obrazów -- izolowane środowiska budowania
+(\fBzpm atomic create/install/enter/list/destroy\fR).
+.SH KOMENDY (TRYB STANDARDOWY)
+.TP
+.B zpm install \fIpakiet...\fR [\-y]
+Szuka i instaluje jeden lub więcej pakietów ze wszystkich obecnych na
+hoście backendów. Składnia \fIpakiet\fR\fB->\fR\fIbackend\fR albo
+\fIpakiet\fR\fB@\fR\fIbackend\fR wymusza konkretny backend.
+.TP
+.B zpm remove \fIpakiet...\fR [\-\-force]
+Usuwa jeden lub więcej pakietów śledzonych przez zpm.
+.TP
+.B zpm update\fR, \fBzpm upgrade\fR, \fBzpm sync
+Aktualizuje wszystkie rejestry równolegle (w tym own-repository.json
+i indeks natywny -- v0.2: przez ETag/If-Modified-Since, więc niezmieniony
+indeks nie jest ponownie pobierany).
+.TP
+.B zpm refresh
+Odświeża TYLKO custom/own-repository.json.
+.TP
+.B zpm list \fR[\fB\-\-json\fR] [\fB\-\-all\fR]
+Listuje pakiety zainstalowane przez zpm (w tym ze statusem "failed").
+\fB\-\-all\fR (v0.2.1) pokazuje widok ujednolicony: baza SQLite ORAZ
+surowe pokwitowania \fBown\fR/\fBnative\fR, z jawnym oznaczeniem wpisów
+obecnych w jednym, a brakujących w drugim (rozjazd).
+.TP
+.B zpm doctor \fR[\fB\-\-fix\fR]
+Diagnostyka: porównuje bazę/pokwitowania zpm ze stanem faktycznym na
+dysku (v0.2: odpytuje też apt/dnf/pacman/zypper/flatpak/snap/brew/
+cargo/npm/pip, nie tylko ekosystem "own"), sprawdza wymogi
+bezpieczeństwa (bwrap/gpg/git w PATH, limity zasobów). \fB\-\-fix\fR
+naprawia automatycznie to, co bezpieczne (osierocone pokwitowania,
+wpisy zpm.lock) -- NIE instaluje ani nie usuwa pakietów samodzielnie.
+.TP
+.B zpm own list \fR[\fB\-\-json\fR]\fR, \fBzpm own info \fInazwa\fR [\fB\-\-json\fR]
+Listuje/opisuje narzędzia z custom/own-repository.json.
+.TP
+.B zpm own build \fInazwa\fR
+(Tylko typ "git") Buduje ze źródeł, z zależnościami, bez instalacji.
+.TP
+.B zpm own install \fInazwa...\fR [\fB\-\-force\fR]
+Instaluje narzędzie(a) "own" (binarne lub git, z zależnościami;
+idempotentnie). v0.2: nieudana instalacja jednego z wielu podanych
+naraz pakietów cofa (rollback) te, które udało się zainstalować W TYM
+SAMYM wywołaniu (patrz \fBsecurity.rollback_on_failure\fR w
+\fBzpm.conf\fR(5)).
+.TP
+.B zpm own remove \fInazwa...\fR [\fB\-\-force\fR]
+.TP
+.B zpm own build\-stage / install\-stage \fIetykieta\fR
+Buduje/instaluje WSZYSTKIE narzędzia z danym \fBstage\fR (bootstrap).
+.TP
+.B zpm own verify\-reproducible \fInazwa\fR
+Buduje dwukrotnie i porównuje wynik (fixed-point / reprodukowalność).
+.TP
+.B zpm lock \fR[\fInazwa...\fR]
+(Ponownie) pinuje zpm.lock: dokładne commity/sha256.
+.TP
+.B zpm pack \fIkatalog\fR \fB\-\-name=\fRN \fB\-\-pkg\-version=\fRV [\fB\-\-arch=\fRA] [\fB\-\-depends=\fRa,b]
+Buduje recipe.janet i pakuje do formatu natywnego .zpk.
+.TP
+.B zpm init \fR[\fB\-\-trust\-keys=\fIplik\fR]
+Inicjalizuje bazę hosta. v0.2: \fB\-\-trust\-keys\fR REALNIE importuje
+i persystuje zestaw zaufanych fingerprintów/kluczy GPG.
+.SH TRYB BUDOWANIA OBRAZÓW (dla zlb, nigdy nie dotyka hosta)
+.TP
+.B zpm \-\-root=\fIścieżka\fR [\-\-backend=apt|dnf|pacman|zypper|brew|own] init [\-\-trust\-keys=\fIplik\fR]
+.TP
+.B zpm \-\-root=\fIścieżka\fR [\-\-backend=...] install|remove \fIpkg...\fR
+.TP
+.B zpm \-\-root=\fIścieżka\fR sync
+.TP
+.B zpm \-\-root=\fIścieżka\fR stage \fIetykieta\fR
+Buduje+instaluje WSZYSTKO z danym \fBstage\fR -- główny hak dla
+buildera (zlb) do pipeline'u bootstrapu.
+.SH FLAGI GLOBALNE
+.TP
+.BR \-y ", " \-\-yes
+Nie pytaj, wybierz automatycznie najlepszego kandydata.
+.TP
+.BR \-c ", " \-\-config= \fIścieżka\fR
+Użyj innego pliku konfiguracyjnego niż /etc/zpm/config.hcl.
+.TP
+.B \-\-user\-db
+Użyj lokalnej bazy w $HOME/.local/share/zpm/zpm.db.
+.TP
+.B \-\-trust\-keys=\fIplik\fR
+(Z \fBinit\fR) zaufaj zestawowi kluczy repo z pliku.
+.TP
+.B \-\-offline
+Nie dotykaj sieci -- tylko lokalny cache/bundle/zpm.lock.
+.TP
+.B \-\-target\-arch=\fIA\fR
+Architektura docelowa (cross-compilation), np. aarch64.
+.TP
+.B \-\-json
+Strukturalne wyjście JSON zamiast tekstu (v0.2: honorowane teraz
+spójnie przez WSZYSTKIE komendy, nie tylko \fBlist\fR/\fBown list\fR).
+.TP
+.B \-\-verbose
+Więcej szczegółów diagnostycznych (v0.2: postęp pobierania, cgroups
+fallback, itp.).
+.TP
+.BR \-q ", " \-\-quiet
+Tylko błędy/wynik końcowy.
+.TP
+.BR \-f ", " \-\-force
+Pomiń idempotencję / reverse-dependency check.
+.TP
+.B \-\-fix
+(Z \fBdoctor\fR) napraw automatycznie to, co bezpieczne.
+.TP
+.BR \-h ", " \-\-help
+.TP
+.BR \-v ", " \-\-version
+.SH PLIKI
+.TP
+.I /etc/zpm/config.hcl
+Konfiguracja główna (sekcje \fBsecurity\fR, \fBstate\fR, \fBcache\fR,
+\fBcustom\fR, \fBnative\fR, \fBatomic\fR...).
+.TP
+.I /var/lib/zpm/zpm.db
+Baza SQLite pakietów zainstalowanych przez zpm.
+.TP
+.I /var/lib/zpm/trusted-keys.list
+v0.2: zaufane fingerprinty GPG (z \fBzpm init \-\-trust\-keys\fR).
+.TP
+.I /var/cache/zpm/http
+v0.2: cache HTTP (ETag/Last-Modified) dla refresh/indeksu natywnego.
+.SH ZOBACZ TAKŻE
+.BR zlb (1),
+dokumentacja online: https://github.com/Zenit-Linux/zpm
+.SH AUTORZY
+Zenit Linux Developers.
