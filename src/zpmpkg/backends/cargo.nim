@@ -1,4 +1,4 @@
-import std/[strutils]
+import std/[strutils, os]
 import ./common
 import ../types
 
@@ -22,6 +22,14 @@ proc search*(query: string): seq[PackageCandidate] =
       name: name, version: "", description: desc, backend: kind,
       installCmd: @["cargo", "install", name], extra: "cargo (binarka trafia do ~/.cargo/bin)"
     ))
+
+proc isInstalled*(name: string): bool =
+  if not isPresent(): return false
+  let (_, code) = runCapture("cargo", @["install", "--list"])
+  # `cargo install --list` nie ma trybu zapytania per-pakiet -- sprawdzamy obecność
+  # binarki o tej nazwie w ~/.cargo/bin jako praktyczne przybliżenie.
+  discard code
+  fileExists(getHomeDir() / ".cargo" / "bin" / name)
 
 proc install*(name: string): int =
   runInteractive("cargo", @["install", name])
