@@ -2,6 +2,8 @@ import std/[os, osproc, strformat, strutils, times]
 import ./types
 import ./config
 import ./ownrepo
+import ./trustedkeys
+import ./logging
 
 type
   BuildTarget* = object
@@ -42,7 +44,7 @@ proc logLine(path, msg: string) =
 proc installIntoRootWithBackend(rootPath, backend, pkg: string, cfg: ZpmConfig): int =
   ## Deleguje instalację "per-pakiet" do menedżera bazowego, ale z flagą
   ## roota/sysroota, tak żeby nic nie trafiło na system, na którym
-  ## budujemy obraz. Wspiera także `own` (ekosystem Zenith, bez curl) i
+  ## budujemy obraz. Wspiera także `own` (ekosystem Zenit, bez curl) i
   ## `brew` (Linuxbrew z prefiksem w roocie obrazu).
   case backend
   of "apt":
@@ -60,23 +62,29 @@ proc installIntoRootWithBackend(rootPath, backend, pkg: string, cfg: ZpmConfig):
     createDir(brewPrefix)
     result = execCmd(&"HOMEBREW_PREFIX={brewPrefix} brew install --appdir={brewPrefix} {pkg}")
   of "own":
-    # Ekosystem Zenith -- pobiera binarkę wprost z own-repository.json i
-    # ląduje w <root>/usr/local/bin, więc to samo narzędzie (np.
-    # `installer`) trafia do gotowego obrazu bez jednego wywołania curl.
+    # Ekosystem Zenit -- narzędzia typu `binary` lądują wprost w
+    # <root>/usr/local/bin (bez jednego wywołania curl); narzędzia typu
+    # `git` są klonowane + budowane (build.<lang>) i instalowane
+    # (install.<lang>) z ZPM_INSTALL_ROOT=<root>, więc trafiają do
+    # gotowego obrazu, nigdy do hosta, na którym budujemy. Instalacja
+    # jest ŚWIADOMA `depends_on` (patrz deps.nim) -- dokładnie to, czego
+    # potrzebuje builder (zlb) do własnego pipeline'u stage0/1/2: on
+    # decyduje KIEDY woła zpm dla którego etapu, a zpm w obrębie
+    # POJEDYNCZEGO wywołania gwarantuje poprawną kolejność zależności.
     let repo = loadOwnRepository(cfg.customRepoPath)
     let destDir = rootPath / "usr" / "local" / "bin"
-    result = installOwn(repo, pkg, destDir)
+    result = if installManyOwn(repo, cfg, @[pkg], destDir, rootPath): 0 else: 1
   else:
-    echo &"[zpm --building] Nieznany backend budowania: {backend}"
+    log(&"[zpm --building] Nieznany backend budowania: {backend}")
     result = 1
 
 proc runBuilding*(cfg: ZpmConfig, rootPath, backend: string, rawPackages: seq[string]) =
   if rootPath.len == 0:
-    echo "[zpm --building] Wymagana flaga --root=<ścieżka> wskazująca katalog docelowy obrazu."
+    log("[zpm --building] Wymagana flaga --root=<ścieżka> wskazująca katalog docelowy obrazu.")
     quit(1)
 
   if not dirExists(rootPath):
-    echo &"[zpm --building] Tworzę katalog docelowy: {rootPath}"
+    log(&"[zpm --building] Tworzę katalog docelowy: {rootPath}")
     createDir(rootPath)
 
   let effectiveBackend = if backend.len > 0: backend else: cfg.defaultBuildingBackend
@@ -85,56 +93,84 @@ proc runBuilding*(cfg: ZpmConfig, rootPath, backend: string, rawPackages: seq[st
   let logPath = ensureBuildLog(cfg)
   let target = BuildTarget(rootPath: rootPath, packages: specs, backend: effectiveBackend, logPath: logPath)
 
-  echo &"[zpm --building] Cel budowania: {rootPath}  (backend domyślny: {effectiveBackend})"
-  echo &"[zpm --building] Log: {logPath}"
+  log(&"[zpm --building] Cel budowania: {rootPath}  (backend domyślny: {effectiveBackend})")
+  log(&"[zpm --building] Log: {logPath}")
   logLine(logPath, &"START build root={rootPath} backend={effectiveBackend} packages={rawPackages}")
 
   var failed: seq[string] = @[]
   for spec in target.packages:
     let pkgBackend = if spec.backend.len > 0: spec.backend else: effectiveBackend
-    echo &"[zpm --building] -> instaluję {spec.name} (backend: {pkgBackend}) do {rootPath}"
+    log(&"[zpm --building] -> instaluję {spec.name} (backend: {pkgBackend}) do {rootPath}")
     let code = installIntoRootWithBackend(rootPath, pkgBackend, spec.name, cfg)
     logLine(logPath, &"install {spec.name}@{pkgBackend} -> exit={code}")
     if code != 0:
       failed.add(spec.name & "@" & pkgBackend)
 
   if failed.len == 0:
-    echo &"[zpm --building] ✔ Zbudowano rootfs/obraz z {target.packages.len} pakietami."
+    log(&"[zpm --building] ✔ Zbudowano rootfs/obraz z {target.packages.len} pakietami.")
   else:
     let failedStr = failed.join(", ")
-    echo &"[zpm --building] ✘ Nie udało się zainstalować: {failedStr}"
+    log(&"[zpm --building] ✘ Nie udało się zainstalować: {failedStr}")
     quit(1)
 
 proc runBuildingInit*(cfg: ZpmConfig, rootPath, trustKeysPath: string) =
   ## `zpm --root <ścieżka> init --trust-keys <plik>` -- wołane przez
   ## `zlb` na starcie każdego modułu; w trybie budowania nie ma bazy
-  ## SQLite do zainicjowania (host jej nie widzi), więc po prostu
-  ## przygotowujemy katalogi i logujemy zaufany zestaw kluczy repo.
+  ## SQLite do zainicjowania (host jej nie widzi), więc przygotowujemy
+  ## katalogi i (v0.2) REALNIE persystujemy zaufany zestaw kluczy repo
+  ## PER-OBRAZ (pod `<rootPath>/etc/zpm/trusted-keys.list`), zamiast tylko
+  ## drukować komunikat -- `verifyGitSignature` wewnątrz TEGO builda
+  ## (kolejne wywołania `zpm --root <rootPath> own install ...`) odczyta
+  ## tę samą listę i odrzuci podpisy spoza niej.
   createDir(rootPath)
   createDir(cfg.buildingCacheDir)
-  echo &"[zpm --root {rootPath}] init"
+  log(&"[zpm --root {rootPath}] init")
   if trustKeysPath.len > 0:
     if fileExists(trustKeysPath):
-      echo &"[zpm --root {rootPath}] ufam zestawowi kluczy repo: {trustKeysPath}"
+      let (ok, count) = importTrustKeysFile(cfg, trustKeysPath, rootPath)
+      if ok:
+        log(&"[zpm --root {rootPath}] ✔ zaimportowano {count} zaufany(ch) klucz(y/e) z {trustKeysPath}")
+      else:
+        log(&"[zpm --root {rootPath}] ✘ {trustKeysPath} nie zawierał rozpoznanego fingerprintu/klucza")
     else:
-      echo &"[zpm --root {rootPath}] ostrzeżenie: brak pliku kluczy {trustKeysPath}"
+      log(&"[zpm --root {rootPath}] ostrzeżenie: brak pliku kluczy {trustKeysPath}")
   let repo = loadOwnRepository(cfg.customRepoPath)
-  echo &"[zpm --root {rootPath}] ekosystem 'own': {repo.tools.len} narzędzi dostępnych"
-
+  log(&"[zpm --root {rootPath}] ekosystem 'own': {repo.tools.len} narzędzi dostępnych")
 proc runBuildingRemove*(cfg: ZpmConfig, rootPath, backend: string, rawPackages: seq[string]) =
   if rawPackages.len == 0: return
   let effectiveBackend = if backend.len > 0: backend else: cfg.defaultBuildingBackend
   for raw in rawPackages:
     let spec = parsePackageSpec(raw)
     let pkgBackend = if spec.backend.len > 0: spec.backend else: effectiveBackend
-    echo &"[zpm --root {rootPath}] usuwam {spec.name} (backend: {pkgBackend})"
+    log(&"[zpm --root {rootPath}] usuwam {spec.name} (backend: {pkgBackend})")
     case pkgBackend
     of "apt": discard execCmd(&"sudo apt remove -y --root={rootPath} {spec.name}")
     of "dnf": discard execCmd(&"sudo dnf remove -y --installroot={rootPath} {spec.name}")
     of "pacman": discard execCmd(&"sudo pacman -R --noconfirm --root {rootPath} {spec.name}")
     of "zypper": discard execCmd(&"sudo zypper --root {rootPath} remove -y {spec.name}")
-    of "own": removeFile(rootPath / "usr" / "local" / "bin" / spec.name)
-    else: echo &"[zpm --root {rootPath}] nieznany backend do usuwania: {pkgBackend}"
-
+    of "own":
+      let repo = loadOwnRepository(cfg.customRepoPath)
+      discard removeOwn(repo, spec.name, cfg, rootPath / "usr" / "local" / "bin", rootPath)
+    else: log(&"[zpm --root {rootPath}] nieznany backend do usuwania: {pkgBackend}")
 proc runBuildingSync*(cfg: ZpmConfig, rootPath: string) =
-  echo &"[zpm --root {rootPath}] sync (odświeżenie metadanych repo w obrazie)"
+  log(&"[zpm --root {rootPath}] sync (odświeżenie metadanych repo w obrazie)")
+proc runBuildingStage*(cfg: ZpmConfig, rootPath, stage: string) =
+  ## `zpm --root=<rootfs> stage <etykieta>` -- instaluje (buduje + instaluje)
+  ## WSZYSTKIE narzędzia `own` oznaczone daną etykietą `stage` wprost do
+  ## rootfs-a obrazu, z zależnościami. To jest główny hak dla buildera
+  ## (np. zlb) do realizacji WŁASNEGO pipeline'u bootstrapu (stage0 -->
+  ## stage1 --> stage2): to builder decyduje, ile razy i w jakiej
+  ## kolejności odpalić tę komendę -- np. `--root=/mnt/rootfs stage
+  ## stage1`, a potem (już wewnątrz `chroot /mnt/rootfs`, świeżym
+  ## toolchainem) `--root=/ stage stage2`. zpm w obrębie JEDNEGO
+  ## wywołania gwarantuje tylko poprawną kolejność `depends_on` --
+  ## resztę orkiestracji (w tym to, skąd wziąć pierwszy `zpm`, żeby
+  ## w ogóle móc to wywołać) świadomie zostawiamy builderowi.
+  if rootPath.len == 0:
+    log("[zpm --building] Wymagana flaga --root=<ścieżka>.")
+    quit(1)
+  createDir(rootPath)
+  let repo = loadOwnRepository(cfg.customRepoPath)
+  let destDir = rootPath / "usr" / "local" / "bin"
+  if not installStageOwn(repo, cfg, stage, destDir, rootPath):
+    quit(1)
