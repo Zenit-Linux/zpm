@@ -22,6 +22,11 @@ proc search*(query: string): seq[PackageCandidate] =
       installCmd: @["sudo", "zypper", "install", "-y", name], extra: "zypper"
     ))
 
+proc isInstalled*(name: string): bool =
+  if not isPresent(): return false
+  let (_, code) = runCapture("rpm", @["-q", name])
+  code == 0
+
 proc install*(name: string): int =
   runInteractive("sudo", @["zypper", "install", "-y", name])
 
