@@ -32,6 +32,11 @@ proc search*(query: string): seq[PackageCandidate] =
         ))
     i.inc
 
+proc isInstalled*(name: string): bool =
+  if not isPresent(): return false
+  let (_, code) = runCapture("pacman", @["-Qi", name])
+  code == 0
+
 proc install*(name: string): int =
   runInteractive("sudo", @["pacman", "-S", "--noconfirm", name])
 
