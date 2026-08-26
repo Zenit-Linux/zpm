@@ -1,0 +1,72 @@
+#compdef zpm
+# v0.2 -- zamyka lukę "shell completion -- nie istnieją".
+# Instalacja: skopiuj do katalogu w $fpath (np.
+# /usr/share/zsh/site-functions/_zpm) i uruchom `compinit`.
+
+_zpm() {
+  local -a commands own_subcommands
+  commands=(
+    'install:Szuka i instaluje pakiety ze wszystkich backendów'
+    'remove:Usuwa pakiety śledzone przez zpm'
+    'update:Aktualizuje wszystkie rejestry'
+    'upgrade:Alias update'
+    'sync:Alias update'
+    'refresh:Odświeża TYLKO own-repository.json'
+    'list:Listuje pakiety zainstalowane przez zpm'
+    'doctor:Diagnostyka bazy/pokwitowań vs stan faktyczny'
+    'own:Ekosystem narzędzi "own" (build/install ze źródeł lub binarnie)'
+    'lock:(Ponownie) pinuje zpm.lock'
+    'pack:Buduje i pakuje do formatu natywnego .zpk'
+    'init:Inicjalizuje bazę hosta'
+    'atomic:Zarządzanie kontenerami atomowymi (build -d:atomic)'
+  )
+  own_subcommands=(
+    'list:Listuje narzędzia z own-repository.json'
+    'info:Szczegóły narzędzia'
+    'build:Buduje ze źródeł bez instalacji (tylko git)'
+    'install:Instaluje narzędzie(a)'
+    'remove:Usuwa narzędzie'
+    'refresh:Alias zpm refresh'
+    'build-stage:Buduje wszystkie narzędzia z danym stage'
+    'install-stage:Instaluje wszystkie narzędzia z danym stage'
+    'verify-reproducible:Buduje dwukrotnie i porównuje (fixed-point)'
+  )
+
+  _arguments -C \
+    '(-y --yes)'{-y,--yes}'[nie pytaj, wybierz najlepszego kandydata]' \
+    '(-c --config)'{-c,--config}'[użyj innego pliku konfiguracyjnego]:plik:_files' \
+    '--user-db[użyj lokalnej bazy $HOME/.local/share/zpm/zpm.db]' \
+    '--trust-keys[(z init) zaufaj zestawowi kluczy repo z pliku]:plik:_files' \
+    '--offline[nie dotykaj sieci]' \
+    '--target-arch[architektura docelowa (cross-compilation)]:arch:' \
+    '--json[strukturalne wyjście JSON]' \
+    '--verbose[więcej szczegółów diagnostycznych]' \
+    '(-q --quiet)'{-q,--quiet}'[tylko błędy/wynik końcowy]' \
+    '(-f --force)'{-f,--force}'[pomiń idempotencję / reverse-dependency check]' \
+    '--fix[(z doctor) napraw automatycznie to, co bezpieczne]' \
+    '--root[tryb budowania obrazów: ścieżka rootfs]:ścieżka:_files -/' \
+    '--backend[wymuś konkretny backend]:backend:(apt dnf pacman zypper brew flatpak snap cargo npm pip own)' \
+    '(-h --help)'{-h,--help}'[pokaż pomoc]' \
+    '(-v --version)'{-v,--version}'[pokaż wersję]' \
+    '1: :->cmd' \
+    '2: :->subcmd' \
+    '*::arg:->args'
+
+  case $state in
+    cmd)
+      _describe 'komenda' commands
+      ;;
+    subcmd)
+      case $words[2] in
+        own)
+          _describe 'podkomenda own' own_subcommands
+          ;;
+        atomic)
+          _values 'podkomenda atomic' create install enter list destroy
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_zpm "$@"
