@@ -255,29 +255,60 @@ zpm dostarcza natomiast narzędzia, na których taki pipeline może stanąć:
 
 Sformalizowana wersja tego, co robi ekosystem `own` typu `git`, ale
 z pełnymi metadanymi (nazwa/wersja/architektura/zależności/suma
-kontrolna) i **spakowanym, wersjonowanym artefaktem** zamiast
-instalowania wprost ze źródeł za każdym razem — odpowiednik
-.deb/.rpm/.pkg.tar.zst, tylko swój (`src/zpmpkg/zpk.nim`).
-
-Budowanie idzie przez konwencję `recipe.janet` (jak `build.janet`, ale
-z kontraktem: gotowe pliki do zainstalowania lądują w katalogu
-wskazanym przez `ZPM_PACKAGE_STAGE_DIR`, względem `/`):
+kontrolna/opcjonalny podpis) i **spakowanym, wersjonowanym artefaktem**
+zamiast instalowania wprost ze źródeł za każdym razem — odpowiednik
+.deb/.rpm/.pkg.tar.zst, tylko swój (`src/zpmpkg/zpk.nim`), w pełni
+zgodny z formatem, który produkuje osobne narzędzie
+[`zpk`](https://github.com/Zenit-Linux/zpk) -- **budowanie `.zpk`
+robi WYŁĄCZNIE `zpk build`** (`zpm` samo nic nie pakuje/nie buduje --
+`zpm` to instalator/menedżer, nie builder); `zpm` zajmuje się
+wyszukiwaniem, instalacją, weryfikacją i usuwaniem gotowych `.zpk`.
 
 ```bash
-zpm pack ./moj-pakiet --name=cr --pkg-version=1.2.0 --arch=x86_64 --depends=zpm
-# -> /var/cache/zpm/packages/cr-1.2.0-x86_64.zpk (+ manifest .json obok)
-#    i od razu dopisany do lokalnego indeksu (native.repo_cache_dir/index.json)
+# zbuduj (w osobnym narzędziu `zpk`, nie tutaj):
+#   zpk init && zpk build --release
 
-zpm search cr                # znajdzie go też przez backend `zenit`
-zpm install cr                # pobiera .zpk (z native.repo_index_url, weryfikuje sha256),
-                              # rozpakowuje względem "/"
+zpm search cr                 # znajdzie go przez backend `zenit`, jeśli jest
+                               # w indeksie (native.repo_index_url)
+zpm install cr                 # pobiera .zpk (z native.repo_index_url), w pełni
+                               # weryfikuje integralność (i podpis, jeśli skonfigurowano
+                               # native.verify_pubkey) PRZED rozpakowaniem względem "/"
+
+zpm install ./cr-1.2.0-x86_64.zpk   # instalacja BEZPOŚREDNIO z lokalnego pliku
+                                     # .zpk (np. zbudowanego przez `zpk build`),
+                                     # z tą samą pełną weryfikacją co wyżej
+
+zpm verify ./cr-1.2.0-x86_64.zpk [--pubkey=~/.zpk/signing-key.pub]
+                               # sprawdza integralność (i podpis, jeśli podano
+                               # --pubkey) bez instalowania -- odpowiednik `zpk verify`
 ```
 
 Indeks (`ZpkRepoIndex`) to jeden plik JSON analogiczny do `Packages.gz`
 z APT — `zpm update`/`zpm refresh` odświeżają go z `native.repo_index_url`
-tak samo jak `own-repository.json`. **Znany brak**: usuwanie pakietów
-`.zpk` nie jest jeszcze wspierane (manifest nie śledzi listy
-zainstalowanych plików per pakiet) — patrz sekcja "Co dalej".
+tak samo jak `own-repository.json`. Instalacja zapisuje pełną listę
+plików pakietu (`ZpkInstallReceipt`), więc `zpm remove <nazwa>` realnie
+kasuje dokładnie to, co zostało zainstalowane (tak jak `.deb`/`.rpm`),
+zamiast tylko odznaczać pakiet jako "zainstalowany".
+
+**Autentyczność (opcjonalna, v0.4):** jeśli `native.verify_pubkey`
+wskazuje na klucz publiczny PEM (RSA/EC lub Ed25519), `zpm install`/
+`zpm verify` weryfikują podpis pakietu (o ile go ma) przed instalacją;
+`native.require_signature = true` odrzuca instalację pakietów, które w
+ogóle nie są podpisane. Bez tej konfiguracji zachowanie jest jak
+wcześniej — weryfikowana jest tylko integralność (sha256), a obecność
+podpisu jest tylko odnotowywana ostrzeżeniem. Patrz też `zpk`'s
+`ZPK_SIGN_KEY`/`zpk build --sign-key=` do podpisywania.
+
+```hcl
+native {
+  repo_index_url    = "https://raw.githubusercontent.com/Zenit-Linux/zenit-repo/main/index.json"
+  repo_cache_dir    = "/var/cache/zpm/native-repo"
+  package_out_dir   = "/var/cache/zpm/packages"
+  verify_pubkey      = "/etc/zpm/keys/zenit-signing.pub"  # opcjonalne
+  require_signature = false                                 # opcjonalne
+}
+```
+
 
 ## 2. Tryb Atomowy (`-d:atomic`)
 
@@ -400,7 +431,7 @@ zpm/
         ├── hcl.nim                # własny, minimalny parser HCL
         ├── config.nim             # wczytywanie /etc/zpm/config.hcl
         ├── database.nim           # warstwa SQLite (centralna baza zainstalowanych pakietów)
-        ├── orchestrator.nim       # serce Trybu Standardowego (search/install/update/refresh/lock/pack/list)
+        ├── orchestrator.nim       # serce Trybu Standardowego (search/install/update/refresh/lock/list)
         ├── ownrepo.nim            # ekosystem `own`: parsowanie/refresh JSON, binarki, build+install git,
         │                          # zależności, stage/bootstrap, offline/vendor, sandbox, reprodukowalność
         ├── deps.nim                # graf zależności `own` (depends_on): sortowanie topologiczne + cykle
@@ -457,6 +488,21 @@ check, realne usuwanie `.zpk`, poprawiony `installed_at`, walidacja
 `schema_version`, `--json`/`zpm doctor`, cross-compilation, natywny
 format `.zpk`, cache kompilacji, haki dla bootstrapu przez `stage`.
 To, co realnie zostaje:
+
+**v0.4 (najnowsze):**
+* Manifest pakietu `.zpk` (`manifest.json`) mieszka W ŚRODKU archiwum,
+  nie w osobnym `<plik>.zpk.json`/`<plik>.zpk.sig` obok niego -- format
+  BIT-W-BIT zgodny z tym, co produkuje osobne narzędzie `zpk`.
+* Weryfikacja PODPISU (nie tylko sha256) pakietów `.zpk` przy
+  `zpm install`/`zpm verify`, sterowana `native.verify_pubkey`/
+  `native.require_signature` -- wcześniej `zpm` w ogóle nie czytało
+  pola `signature` z manifestu, nawet jeśli `zpk` je policzyło.
+* `zpm verify <plik.zpk>` -- lokalny odpowiednik `zpk verify`.
+* `zpm install <plik.zpk>` -- instalacja BEZPOŚREDNIO z lokalnego
+  pliku, z pełną weryfikacją, bez przechodzenia przez indeks.
+* `own-repository.json`: pole `bin` może być obiektem `{arch: url}`
+  (multi-arch) -- wcześniej `zpm` po cichu odrzucało takie wpisy jako
+  "puste 'bin'"; teraz wybiera wariant dla `native.target_arch`/hosta.
 
 **Bezpieczeństwo (v0.2/v0.3):**
 * Sandbox przez `bwrap` (domyślnie) LUB przez efemeryczny kontener
@@ -515,7 +561,7 @@ To, co realnie zostaje:
 **Operacyjne:**
 * Testy jednostkowe/integracyjne (`nimble test`) i CI budujące oba
   warianty (standard + atomic), najlepiej też z realnym `zpm refresh`,
-  `zpm lock`, `zpm own build-stage`/`verify-reproducible`, `zpm pack`
+  `zpm lock`, `zpm own build-stage`/`verify-reproducible`, `zpm verify`
   i `zpm doctor` przeciw testowemu repo git/recipe.janet.
 * Strony podręcznika / shell completion (bash/zsh/fish) — nie istnieją.
 * `zpm doctor` nie naprawia niczego automatycznie (celowo, patrz wyżej)
