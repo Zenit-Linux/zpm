@@ -445,22 +445,6 @@ proc cmdLock*(cfg: ZpmConfig, names: seq[string]) =
   saveLock(cfg.lockPath, lock)
   echo &"[zpm:lock] Zapisano {cfg.lockPath} ({lock.entries.len} wpisów)."
 
-proc cmdPack*(cfg: ZpmConfig, recipeDir, name, version, arch: string, dependsOn: seq[string]) =
-  ## `zpm pack <katalog> --name=... --version=... [--arch=...] [--depends=a,b]`
-  ## -- buduje `recipe.janet` w `recipeDir` i pakuje wynik do natywnego
-  ## formatu `.zpk` (patrz zpk.nim), dopisując go od razu do lokalnego
-  ## indeksu (`nativeRepoCacheDir/index.json`), żeby `zpm search`/
-  ## `zpm install` @ backend `zenit` widziały go natychmiast.
-  let effArch = if arch.len > 0: arch else: hostArch()
-  let (ok, path) = buildZpk(recipeDir, name, version, effArch, dependsOn, cfg)
-  if not ok:
-    quit(1)
-  let manifestPath = path & ".json"
-  if fileExists(manifestPath):
-    addToIndex(cfg, loadManifestFile(manifestPath))
-    let indexPath = cfg.nativeRepoCacheDir / "index.json"
-    echo &"[zpm:pack] ✔ Dopisano do lokalnego indeksu ({indexPath})."
-
 proc cmdInit*(cfg: ZpmConfig, trustKeysPath: string) =
   ## Bootstrapuje bazę zpm oraz (opcjonalnie) zaufany zestaw kluczy repo
   ## wskazany przez --trust-keys <ścieżka> (patrz zlbpkg/keys.nim w zlb,
