@@ -11,7 +11,7 @@ import ./netutil
 import ./containerengine
 
 const DefaultOwnRepoPath* = "/etc/zpm/custom/own-repository.json"
-const DefaultOwnRepoUrl* = "https://raw.githubusercontent.com/Zenit-Linux/zpm/main/custom/own-repository.json"
+const DefaultOwnRepoUrl* = "https://raw.githubusercontent.com/Zenit-Linux/own-repository/main/repo/own-repository.json"
 const SupportedOwnSchemaVersions = [1, 2]
   ## Wersje `schema_version` z custom/own-repository.json, które ten zpm
   ## UMIE poprawnie zinterpretować. Nowszy plik (przyszła migracja formatu)
@@ -73,6 +73,47 @@ proc jsonStrSeq(node: JsonNode, key: string): seq[string] =
 proc looksLikeGitUrl(s: string): bool =
   s.endsWith(".git") or s.startsWith("git@") or s.startsWith("git://") or s.startsWith("ssh://git@")
 
+proc hostArch*(): string =
+  ## Architektura hosta, na którym akurat DZIAŁA zpm (nie mylić z
+  ## `cfg.targetArch` -- tą, DLA której budujemy przy cross-compilacji).
+  let output = execProcess("uname", args = @["-m"], options = {poUsePath})
+  output.strip()
+
+proc parseOwnBin(item: JsonNode): tuple[bin: string, byArch: seq[tuple[arch, url: string]]] =
+  ## v0.4 -- "bin" może być zwykłym stringiem (jedna, nieoznaczona
+  ## architektura -- kompatybilność wsteczna) ALBO obiektem
+  ## `{"x86_64": url, "aarch64": url, ...}`, dokładnie to, co `zpk
+  ## schedule-release` publikuje dla pakietów zbudowanych na WIĘCEJ NIŻ
+  ## JEDNĄ architekturę (patrz `zpk` repo, `release.nim`/
+  ## `buildOwnRepoEntry`). Wcześniej `item{"bin"}.getStr("")` na obiekcie
+  ## JSON po cichu zwracało "" -- multi-arch wpis wyglądał jak PUSTY
+  ## `bin`, więc `parseOwnTool` odrzucało go jako niepoprawny ("wymaga
+  ## niepustego pola 'bin'"), mimo że dane były tam, tylko w innym
+  ## kształcie niż spodziewany.
+  if not item.hasKey("bin"):
+    return ("", @[])
+  case item["bin"].kind
+  of JString:
+    (item["bin"].getStr(""), @[])
+  of JObject:
+    var byArch: seq[tuple[arch, url: string]] = @[]
+    for arch, v in item["bin"].pairs:
+      if v.kind == JString and v.getStr("").len > 0:
+        byArch.add (arch, v.getStr(""))
+    if byArch.len == 0:
+      return ("", @[])
+    # Wybierz wariant dla architektury HOSTA jako `bin` (wartość używana
+    # wszędzie tam, gdzie kod NIE jest świadomy multi-arch -- `own
+    # list`/`own info`, stary `downloadOwnTool` bez jawnego `cfg` itp.);
+    # jeśli hosta nie ma wśród wariantów, spadamy na PIERWSZY zdefiniowany
+    # (kolejność zachowana z JSON-a) zamiast po cichu zwracać "".
+    let host = hostArch()
+    for (arch, url) in byArch:
+      if arch == host: return (url, byArch)
+    (byArch[0].url, byArch)
+  else:
+    ("", @[])
+
 proc parseOwnTool*(item: JsonNode): OwnRepoTool =
   ## Parsuje pojedynczy wpis "tools[]". Rzuca ValueError przy brakujących
   ## polach wymaganych dla danego typu narzędzia -- wołający decyduje, czy
@@ -81,17 +122,17 @@ proc parseOwnTool*(item: JsonNode): OwnRepoTool =
   if name.len == 0:
     raise newException(ValueError, "wpis bez pola 'name'")
 
-  let binRaw = item{"bin"}.getStr("")
+  let (binResolved, binByArch) = parseOwnBin(item)
   let repoRaw = item{"repo"}.getStr("")
   let typeRaw = item{"type"}.getStr("")
 
   let isGit = typeRaw.toLowerAscii == "git" or repoRaw.len > 0 or
-              (typeRaw.len == 0 and looksLikeGitUrl(binRaw))
+              (typeRaw.len == 0 and looksLikeGitUrl(binResolved))
 
   let lang = item{"lang"}.getStr("janet")
 
   if isGit:
-    let repoUrl = if repoRaw.len > 0: repoRaw else: binRaw
+    let repoUrl = if repoRaw.len > 0: repoRaw else: binResolved
     if repoUrl.len == 0:
       raise newException(ValueError, &"narzędzie '{name}': typ 'git' wymaga pola 'repo' (lub 'bin' z URL-em .git)")
     result = OwnRepoTool(
@@ -114,17 +155,20 @@ proc parseOwnTool*(item: JsonNode): OwnRepoTool =
       signed: item{"signed"}.getBool(false),
     )
   else:
-    if binRaw.len == 0:
-      raise newException(ValueError, &"narzędzie '{name}': typ 'binary' wymaga niepustego pola 'bin'")
+    if binResolved.len == 0:
+      raise newException(ValueError, &"narzędzie '{name}': typ 'binary' wymaga niepustego pola 'bin' " &
+        "(string albo obiekt {arch: url} z co najmniej jednym niepustym wariantem)")
     result = OwnRepoTool(
       name: name,
       kind: otkBinary,
-      bin: binRaw,
+      bin: binResolved,
+      binByArch: binByArch,
       sha256: item{"sha256"}.getStr(""),
       info: item{"info"}.getStr(""),
       dependsOn: jsonStrSeq(item, "depends_on"),
       stage: item{"stage"}.getStr(""),
     )
+
 
 proc parseOwnRepositoryJson*(raw: string, strict: bool = true): OwnRepository =
   ## `strict=true` (domyślnie, używane przez `refresh`): CAŁY plik jest
@@ -369,18 +413,39 @@ proc sha256sumOf*(path: string): string =
   if sha.len == 0: return ""
   sha.split(' ')[0].strip()
 
+proc resolveOwnBinUrl*(tool: OwnRepoTool, cfg: ZpmConfig): string =
+  ## v0.4 -- wybiera właściwy URL z `tool.binByArch` dla ARCHITEKTURY
+  ## DOCELOWEJ pobierania: `cfg.targetArch`, jeśli ustawione (cross-arch,
+  ## np. budowanie obrazu innej dystrybucji), inaczej architektura hosta.
+  ## Dla wpisów jednoarchitekturowych (`binByArch` puste -- "bin" był
+  ## zwykłym stringiem w JSON-ie) po prostu zwraca `tool.bin` -- pełna
+  ## kompatybilność wsteczna, zero zmiany zachowania dla starych wpisów.
+  if tool.binByArch.len == 0:
+    return tool.bin
+  let want = if cfg.targetArch.len > 0: cfg.targetArch else: hostArch()
+  for (arch, url) in tool.binByArch:
+    if arch == want: return url
+  # Architektura docelowa nie ma dedykowanego builda -- spadamy na to, co
+  # `parseOwnTool` już wybrało jako "najlepsze dopasowanie" (host albo
+  # pierwszy wariant), zamiast twardo zawodzić.
+  log(&"[zpm:own] ⚠ '{tool.name}': brak wariantu 'bin' dla architektury '{want}' -- używam {tool.bin}")
+  tool.bin
+
 proc downloadOwnTool*(tool: OwnRepoTool, destDir: string, cfg: ZpmConfig): tuple[ok: bool, path: string] =
   ## Pobiera binarkę narzędzia z jego dosłownego URL-a przez netutil.nim
   ## (v0.2: honoruje `security.trusted_hosts`/`max_download_mb`, loguje
   ## postęp pobierania co ~10% pod --verbose -- zamiast w pełni cichego
   ## `std/httpclient.downloadFile` bez żadnej z tych warstw),
   ## zapisuje do destDir/<name>, ustawia +x i (jeśli podano) weryfikuje sha256.
-  if tool.bin.len == 0:
+  ## v0.4: jeśli narzędzie ma kilka wariantów architektur (`binByArch`),
+  ## wybiera ten pasujący do `cfg.targetArch`/hosta -- patrz `resolveOwnBinUrl`.
+  let binUrl = resolveOwnBinUrl(tool, cfg)
+  if binUrl.len == 0:
     return (false, "")
   createDir(destDir)
   let dest = destDir / tool.name
-  log(&"[zpm:own] Pobieram '{tool.name}' z {tool.bin} ...")
-  let (dlOk, dlErr) = safeDownloadFile(tool.bin, dest, cfg, "zpm:own")
+  log(&"[zpm:own] Pobieram '{tool.name}' z {binUrl} ...")
+  let (dlOk, dlErr) = safeDownloadFile(binUrl, dest, cfg, "zpm:own")
   if not dlOk:
     stderr.writeLine(&"[zpm:own] ✘ Pobieranie '{tool.name}' nie powiodło się: {dlErr}")
     return (false, "")
@@ -410,12 +475,6 @@ proc toolCacheDir*(cfg: ZpmConfig, tool: OwnRepoTool): string =
 
 proc bundlePath(cfg: ZpmConfig, tool: OwnRepoTool): string =
   cfg.ownGitCacheDir / (tool.name & ".bundle")
-
-proc hostArch*(): string =
-  ## Architektura hosta, na którym akurat DZIAŁA zpm (nie mylić z
-  ## `cfg.targetArch` -- tą, DLA której budujemy przy cross-compilacji).
-  let output = execProcess("uname", args = @["-m"], options = {poUsePath})
-  output.strip()
 
 proc effectiveGitRef*(tool: OwnRepoTool, cfg: ZpmConfig): tuple[refStr: string, fromLock: bool] =
   ## Zwraca ref, którego NAPRAWDĘ mamy użyć: jeśli zpm.lock ma wpis dla
@@ -1254,7 +1313,18 @@ proc ownToolToJson(t: OwnRepoTool): JsonNode =
   result["stage"] = %t.stage
   case t.kind
   of otkBinary:
-    result["bin"] = %t.bin
+    if t.binByArch.len > 0:
+      # v0.4 -- odtwarzamy oryginalny kształt obiektu {arch: url}, nie
+      # spłaszczamy z powrotem do samego `bin` (który jest tylko
+      # WYLICZONYM wariantem dla hosta -- patrz `parseOwnBin`); w
+      # przeciwnym razie merge branchy (patrz `mergeToolBranches` niżej)
+      # albo `own list --json` po cichu gubiłyby pozostałe architektury.
+      var byArchObj = newJObject()
+      for (arch, url) in t.binByArch:
+        byArchObj[arch] = %url
+      result["bin"] = byArchObj
+    else:
+      result["bin"] = %t.bin
     result["sha256"] = %t.sha256
   of otkGit:
     result["repo"] = %t.repo
