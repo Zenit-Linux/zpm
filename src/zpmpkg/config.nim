@@ -79,7 +79,10 @@ proc defaultConfig*(): ZpmConfig =
 
     nativeRepoIndexUrl: "https://raw.githubusercontent.com/Zenit-Linux/zenit-repo/main/index.json",
     nativeRepoCacheDir: "/var/cache/zpm/native-repo",
-    nativePackageOutDir: "/var/cache/zpm/packages"
+    nativePackageOutDir: "/var/cache/zpm/packages",
+
+    nativeVerifyPubkey: "",
+    nativeRequireSignature: false,
   )
 
 proc loadConfig*(path: string = DefaultConfigPath): ZpmConfig =
@@ -190,6 +193,12 @@ proc loadConfig*(path: string = DefaultConfigPath): ZpmConfig =
     result.nativeRepoIndexUrl = native.getStr("repo_index_url", result.nativeRepoIndexUrl)
     result.nativeRepoCacheDir = native.getStr("repo_cache_dir", result.nativeRepoCacheDir)
     result.nativePackageOutDir = native.getStr("package_out_dir", result.nativePackageOutDir)
+    # v0.4 -- autentyczność pakietów .zpk (patrz zpmpkg/signing.nim).
+    # Puste `verify_pubkey` (domyślne) == kompatybilność wsteczna: tylko
+    # integralność (sha256), podpis (jeśli obecny) NIE jest weryfikowany
+    # automatycznie, tylko odnotowywany ostrzeżeniem.
+    result.nativeVerifyPubkey = native.getStr("verify_pubkey", result.nativeVerifyPubkey)
+    result.nativeRequireSignature = native.getBool("require_signature", result.nativeRequireSignature)
     let distroImages = native.findBlock("distro_images")
     if distroImages != nil:
       for k, v in distroImages.attrs:
