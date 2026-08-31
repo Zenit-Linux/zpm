@@ -86,8 +86,24 @@ type
   OwnRepoTool* = object
     name*: string              ## nazwa narzędzia, np. "zpm", "installer", "cr"
     kind*: OwnToolKind          ## otkBinary | otkGit
-    bin*: string                ## dosłowny URL do binarki (tylko dla otkBinary)
-    sha256*: string             ## opcjonalny checksum do weryfikacji (może być puste)
+    bin*: string                ## URL do binarki DLA BIEŻĄCEGO hosta (tylko dla otkBinary) --
+                                  ## wyliczone z `binByArch` (patrz niżej) w chwili parsowania:
+                                  ## jeśli "bin" w JSON-ie było obiektem {arch: url}, to jest to
+                                  ## wpis pasujący do `hostArch()`; jeśli było zwykłym stringiem,
+                                  ## to jest to po prostu ta wartość wprost (kompatybilność wsteczna).
+    binByArch*: seq[tuple[arch, url: string]]  ## v0.4 -- WSZYSTKIE warianty architektur z "bin",
+                                  ## w kolejności występowania w JSON-ie. Puste, jeśli "bin" był
+                                  ## zwykłym stringiem (jedna, nieoznaczona architektura -- "any").
+                                  ## To jest dokładnie to, co `zpk schedule-release` publikuje dla
+                                  ## pakietów zbudowanych na WIĘCEJ NIŻ JEDNĄ architekturę (patrz
+                                  ## `zpk` repo, `release.nim`/`buildOwnRepoEntry`) -- wcześniej zpm
+                                  ## w ogóle nie umiało tego sparsować (getStr("") na obiekcie JSON
+                                  ## zwraca "", więc `zpk deps`/`bin` był traktowany jako pusty i
+                                  ## cały wpis odrzucany jako niepoprawny).
+    sha256*: string             ## opcjonalny checksum do weryfikacji (może być puste) -- dla
+                                  ## wariantu wybranego jako `bin` (per-arch sha256 nie jest jeszcze
+                                  ## publikowane osobno przez `zpk`, więc jeden wspólny checksum,
+                                  ## jeśli w ogóle podany, dotyczy tylko wariantu jednoarchitekturowego)
     info*: string                ## opcjonalny, krótki opis narzędzia
     repo*: string                ## URL repozytorium git (tylko dla otkGit)
     gitRef*: string              ## branch/tag/commit do checkoutowania (domyślnie "main")
@@ -149,6 +165,20 @@ type
     builtAt*: string                ## znacznik czasu ISO8601 builda pakietu
     files*: seq[ZpkFileEntry]        ## lista plików (ścieżka względna do "/" + sha256) --
                                       ## pozwala na realne `zpm remove` (jak w .deb), nie tylko instalację
+    signature*: string               ## v0.4 -- podpis (base64) całego archiwum .zpk, DOKŁADNIE ten sam
+                                      ## format co `manifest["signature"]` produkowane przez `zpk build
+                                      ## --sign-key=...` (patrz `zpk` repo, `builder.nim`/`signing.nim`).
+                                      ## Puste == pakiet niepodpisany (tylko integralność sha256, jak
+                                      ## poprzednio). Wcześniej zpm w ogóle nie czytało/zapisywało tego
+                                      ## pola przy (de)serializacji manifestu -- podpis, nawet jeśli
+                                      ## `zpk` go policzyło, był po cichu gubiony przy każdym przejściu
+                                      ## przez indeks/instalację.
+    signedWith*: string               ## nazwa pliku klucza użytego do podpisania (informacyjnie,
+                                      ## `manifest["signed_with"]` u `zpk`) -- NIE jest to fingerprint
+                                      ## ani klucz publiczny, tylko podpowiedź dla operatora, którym
+                                      ## kluczem prywatnym podpisano (odpowiedzialność za faktyczne
+                                      ## zaufanie leży po stronie skonfigurowanego `--pubkey`/
+                                      ## `native.verify_pubkey`, patrz `zpmpkg/signing.nim`).
 
   ZpkFileEntry* = object
     path*: string     ## ścieżka WZGLĘDNA do "/", np. "usr/local/bin/cr"
@@ -303,4 +333,18 @@ type
     # ---- natywny format pakietów (.zpk / bkZenitNat) ---------------------------
     nativeRepoIndexUrl*: string    ## URL zdalnego indeksu pakietów .zpk (jak Packages.gz w APT)
     nativeRepoCacheDir*: string     ## lokalny cache indeksu + pobranych .zpk
-    nativePackageOutDir*: string     ## gdzie `zpm pack` zostawia zbudowane .zpk
+    nativePackageOutDir*: string     ## katalog na zbudowane pakiety .zpk (obecnie
+                                      ## bez wbudowanego budowania -- patrz `zpk`, osobne narzędzie)
+
+    # ---- v0.4: autentyczność pakietów .zpk (podpis kryptograficzny) ----------
+    nativeVerifyPubkey*: string     ## native.verify_pubkey -- ścieżka do klucza publicznego PEM
+                                      ## (RSA/EC albo Ed25519, wykrywane automatycznie -- patrz
+                                      ## `zpmpkg/signing.nim`) używanego do weryfikacji `manifest.signature`
+                                      ## przy `zpm install`/`zpm verify`. Puste == nie weryfikuj podpisów
+                                      ## automatycznie (nadal weryfikowane jest sha256 -- integralność,
+                                      ## nie autentyczność; kompatybilność wsteczna z zachowaniem sprzed v0.4).
+    nativeRequireSignature*: bool    ## native.require_signature -- jeśli true, `zpm install` ODMAWIA
+                                      ## zainstalowania pakietu .zpk BEZ podpisu (manifest.signature puste),
+                                      ## niezależnie od tego, czy `nativeVerifyPubkey` jest ustawione.
+                                      ## Domyślnie false (podpisywanie jest opcjonalne w całym ekosystemie
+                                      ## `.zpk`, tak jak w `zpk`).
