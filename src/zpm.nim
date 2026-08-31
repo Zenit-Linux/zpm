@@ -10,8 +10,9 @@ when defined(atomic):
 else:
   import ./zpmpkg/orchestrator
   import ./zpmpkg/building
+  import ./zpmpkg/zpk
 
-const ZpmVersion = "0.3.0"
+const ZpmVersion = "0.4.0"
 
 proc printBanner() =
   when defined(atomic):
@@ -64,8 +65,12 @@ proc printHelp() =
     echo "  zpm own verify-reproducible <n>  Buduje 'n' dwukrotnie i porównuje wynik (fixed-point)"
     echo "  zpm lock [nazwa...]              (Ponownie) pinuje zpm.lock: dokładne commity/sha256"
     echo "                                   (puste = wszystkie narzędzia own-repository.json)"
-    echo "  zpm pack <katalog> --name=N --pkg-version=V [--arch=A] [--depends=a,b]"
-    echo "                                   Buduje recipe.janet i pakuje do formatu natywnego .zpk"
+    echo "  zpm verify <plik.zpk> [--pubkey=P]"
+    echo "                                   Sprawdza integralność (sha256 zawartości, per-plik i"
+    echo "                                   zagregowaną) i, jeśli podano --pubkey, autentyczność"
+    echo "                                   (podpis) archiwum .zpk -- manifest wewnątrz archiwum"
+    echo "  zpm install <plik.zpk>            (v0.4) instaluje BEZPOŚREDNIO z lokalnego pliku .zpk,"
+    echo "                                   z pełną weryfikacją integralności/podpisu przed instalacją"
     echo "  zpm init                          Inicjalizuje bazę hosta (patrz --trust-keys)"
     echo ""
     echo "  Tryb budowania obrazów (rootfs dla zlb, nigdy nie dotyka hosta):"
@@ -89,6 +94,7 @@ proc printHelp() =
     echo "                       (przy braku cache'u/bundla `own`/`native` po prostu się nie uda)"
     echo "      --target-arch=A  architektura DOCELOWA (cross-compilation), np. aarch64"
     echo "                       przekazywana skryptom jako ZPM_TARGET_ARCH (patrz README)"
+    echo "      --pubkey=P       (z `verify`) klucz publiczny PEM do weryfikacji podpisu pakietu .zpk"
     echo "      --json           strukturalne wyjście JSON (own list/info, list) zamiast tekstu"
     echo "      --verbose        więcej szczegółów diagnostycznych"
     echo "  -q, --quiet          tylko błędy/wynik końcowy"
@@ -164,10 +170,7 @@ else:
     var force = false
     var doctorFix = false
     var listAll = false
-    var packName = ""
-    var packVersion = ""
-    var packArch = ""
-    var packDepends = ""
+    var pubKeyOpt = ""
     var positional: seq[string] = @[]
 
     var p = initOptParser(commandLineParams())
@@ -194,10 +197,7 @@ else:
         of "force", "f": force = true
         of "fix": doctorFix = true
         of "all", "a": listAll = true
-        of "name": packName = val
-        of "pkg-version": packVersion = val
-        of "arch": packArch = val
-        of "depends": packDepends = val
+        of "pubkey": pubKeyOpt = val
         else: discard
       of cmdEnd: discard
 
@@ -255,13 +255,20 @@ else:
       cmdLock(cfg, positional[1..^1])
       return
 
-    # `zpm pack <katalog> --name=... --pkg-version=... [--arch=...] [--depends=a,b]`
-    if positional[0] == "pack":
-      if positional.len < 2 or packName.len == 0 or packVersion.len == 0:
-        echo "[zpm pack] Użycie: zpm pack <katalog-z-recipe.janet> --name=N --pkg-version=V [--arch=A] [--depends=a,b]"
+    # `zpm verify <plik.zpk> [--pubkey=...]` -- odpowiednik `zpk verify`:
+    # manifest (v0.4) mieszka W ŚRODKU archiwum, nie obok niego.
+    if positional[0] == "verify":
+      if positional.len < 2:
+        echo "[zpm verify] Użycie: zpm verify <plik.zpk> [--pubkey=<klucz publiczny PEM>]"
         quit(1)
-      let deps = if packDepends.len > 0: packDepends.split(',') else: @[]
-      cmdPack(cfg, positional[1], packName, packVersion, packArch, deps)
+      let (ok, _, messages) = verifyZpkArchive(positional[1], pubKeyOpt)
+      for msg in messages:
+        echo (if ok: "[zpm verify] ✔ " else: "[zpm verify]   ") & msg
+      if ok:
+        echo &"[zpm verify] ✔ {positional[1]} zweryfikowany pomyślnie."
+      else:
+        stderr.writeLine(&"[zpm verify] ✘ weryfikacja {positional[1]} nie powiodła się.")
+        quit(1)
       return
 
     # `zpm doctor` -- diagnostyka rozjazdu baza/pokwitowania vs stan faktyczny.
@@ -360,9 +367,26 @@ else:
     case positional[0]
     of "install":
       if positional.len < 2:
-        echo "[zpm] Użycie: zpm install <pakiet...> [-y]"
+        echo "[zpm] Użycie: zpm install <pakiet...|plik.zpk> [-y]"
         return
-      cmdInstall(cfg, db, positional[1..^1], assumeYes)
+      # v0.4 -- argumenty kończące się na ".zpk" i faktycznie istniejące
+      # na dysku instalowane są BEZPOŚREDNIO z pliku (pełna weryfikacja
+      # integralności/podpisu, patrz installLocalZpk w zpk.nim), zamiast
+      # iść przez wyszukiwanie po backendach (które i tak nie znałoby
+      # ścieżki do lokalnego pliku jako "nazwy pakietu"). Reszta
+      # argumentów (zwykłe nazwy) idzie normalną ścieżką `cmdInstall`.
+      var localFailed = false
+      var remaining: seq[string] = @[]
+      for arg in positional[1..^1]:
+        if arg.toLowerAscii.endsWith(".zpk") and fileExists(arg):
+          if installLocalZpk(arg, "/", cfg) != 0:
+            localFailed = true
+        else:
+          remaining.add arg
+      if remaining.len > 0:
+        cmdInstall(cfg, db, remaining, assumeYes)
+      if localFailed:
+        quit(1)
     of "remove", "uninstall":
       if positional.len < 2:
         echo "[zpm] Użycie: zpm remove <pakiet...> [--force]"
