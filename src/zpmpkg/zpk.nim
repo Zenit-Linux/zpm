@@ -3,43 +3,28 @@ import ./types
 import ./lockfile
 import ./netutil
 import ./logging
+import ./signing
 
 ## Natywny format pakietów Zenit Linux -- `.zpk` (`bkZenitNat` w types.nim).
 ##
 ## To sformalizowana wersja tego, co robi ekosystem `own` typu `git`
 ## (build.<lang> + install.<lang>), tyle że zamiast instalować wprost ze
-## źródeł za każdym razem, produkuje SPAKOWANY, wersjonowany artefakt
-## z manifestem (nazwa/wersja/architektura/zależności/suma kontrolna),
-## który potem można instalować wielokrotnie bez ponownego budowania --
-## odpowiednik .deb/.rpm/.pkg.tar.zst, ale swój.
+## źródeł za każdym razem, jest to SPAKOWANY, wersjonowany artefakt
+## z manifestem (nazwa/wersja/architektura/zależności/suma kontrolna/
+## opcjonalny podpis), który potem można instalować wielokrotnie bez
+## ponownego budowania -- odpowiednik .deb/.rpm/.pkg.tar.zst, ale swój.
 ##
-## Przepis budowania: `recipe.janet` (konwencja analogiczna do build.janet
-## z ekosystemu `own`, ale z dodatkowym kontraktem: musi zostawić GOTOWE
-## pliki do zainstalowania w katalogu wskazanym przez ZPM_PACKAGE_STAGE_DIR,
-## z układem względnym do "/", np. usr/local/bin/narzedzie).
+## `zpm` samo NIE BUDUJE pakietów `.zpk` -- budowanie (recipe.janet ->
+## staging -> tar) robi WYŁĄCZNIE osobne narzędzie `zpk`
+## (https://github.com/Zenit-Linux/zpk, `zpk build`). Ten moduł zajmuje
+## się wyszukiwaniem, pobieraniem, weryfikacją (integralność + podpis)
+## i instalacją/usuwaniem gotowych `.zpk` -- bit-w-bit tym samym
+## formatem, który `zpk build` produkuje.
 ##
 ## Indeks repozytorium: pojedynczy JSON (`ZpkRepoIndex`) analogiczny do
 ## Packages.gz z APT -- lista manifestów wszystkich dostępnych pakietów.
 
 const ManifestFileName* = "manifest.json"
-
-proc manifestToJson(m: ZpkManifest): JsonNode =
-  result = newJObject()
-  result["name"] = %m.name
-  result["version"] = %m.version
-  result["arch"] = %m.arch
-  result["depends_on"] = %m.dependsOn
-  result["sha256"] = %m.sha256
-  result["description"] = %m.description
-  result["build_recipe"] = %m.buildRecipe
-  result["built_at"] = %m.builtAt
-  var filesArr = newJArray()
-  for f in m.files:
-    var fj = newJObject()
-    fj["path"] = %f.path
-    fj["sha256"] = %f.sha256
-    filesArr.add fj
-  result["files"] = filesArr
 
 proc manifestFromJson(n: JsonNode): ZpkManifest =
   var deps: seq[string] = @[]
@@ -60,92 +45,131 @@ proc manifestFromJson(n: JsonNode): ZpkManifest =
     buildRecipe: n{"build_recipe"}.getStr(""),
     builtAt: n{"built_at"}.getStr(""),
     files: files,
+    signature: n{"signature"}.getStr(""),
+    signedWith: n{"signed_with"}.getStr(""),
   )
 
 proc packageFileName*(m: ZpkManifest): string =
   &"{m.name}-{m.version}-{m.arch}.zpk"
-
-proc loadManifestFile*(path: string): ZpkManifest =
-  ## Wczytuje manifest zapisany OBOK archiwum .zpk (`<pakiet>.zpk.json`,
-  ## patrz `buildZpk`) -- używane przez `zpm pack`, żeby po zbudowaniu
-  ## dopisać dokładnie ten sam manifest do lokalnego indeksu, bez
-  ## powtórnego parsowania ad-hoc w orchestrator.nim.
-  manifestFromJson(parseJson(readFile(path)))
 
 proc sha256sumOf(path: string): string =
   let sha = execProcess("sha256sum", args = @[path], options = {poUsePath})
   if sha.len == 0: return ""
   sha.split(' ')[0].strip()
 
+proc sha256sumOfString(content: string): string =
+  ## sha256 dowolnego tekstu -- zapisuje do pliku tymczasowego i
+  ## przepuszcza przez `sha256sumOf` (jeden mechanizm liczenia sum w
+  ## całym zpm, zamiast osobnej implementacji sha256 w czystym Nim).
+  let tmp = getTempDir() / &"zpm-strdigest-{$epochTime().int}-{getCurrentProcessId()}.tmp"
+  writeFile(tmp, content)
+  defer: removeFile(tmp)
+  sha256sumOf(tmp)
+
+proc contentDigestInput(files: seq[ZpkFileEntry]): string =
+  ## Kanoniczna reprezentacja "zawartości pakietu" (patrz identyczna
+  ## funkcja w `zpk` repo, `zpkpkg/builder.nim`) -- MUSI dawać identyczny
+  ## wynik jak po stronie `zpk build` (jedyne narzędzie, które faktycznie
+  ## BUDUJE `.zpk` -- `zpm` samo tylko instaluje/weryfikuje), inaczej
+  ## `zpm verify`/`zpm install` nie zweryfikowałoby poprawnego pakietu.
+  var sorted = files
+  sorted.sort(proc(a, b: ZpkFileEntry): int = cmp(a.path, b.path))
+  var parts: seq[string] = @[]
+  for f in sorted: parts.add(f.path & "\t" & f.sha256)
+  parts.join("\n") & "\n"
+
+proc contentDigestOf(files: seq[ZpkFileEntry]): string =
+  sha256sumOfString(contentDigestInput(files))
+
+proc extractManifestFromArchive*(zpkPath: string): tuple[ok: bool, manifest: ZpkManifest, err: string] =
+  ## Wyciąga `manifest.json` Z ŚRODKA archiwum `.zpk` (v0.4 -- manifest już
+  ## nie leży obok w osobnym `<plik>.zpk.json`, patrz `zpk build` w osobnym
+  ## repo `zpk`). Używane przez `zpm verify` i przez `installZpk` PRZED
+  ## rozpakowaniem reszty.
+  if not fileExists(zpkPath):
+    return (false, ZpkManifest(), &"nie znaleziono {zpkPath}")
+  let (output, code) = execCmdEx(&"tar -xOf {quoteShell(zpkPath)} {quoteShell(ManifestFileName)}")
+  if code != 0 or output.strip().len == 0:
+    return (false, ZpkManifest(), &"nie udało się odczytać '{ManifestFileName}' z wnętrza {zpkPath} " &
+      &"(kod {code}) -- czy to na pewno poprawne archiwum .zpk?")
+  try:
+    (true, manifestFromJson(parseJson(output)), "")
+  except CatchableError as e:
+    (false, ZpkManifest(), &"'{ManifestFileName}' wewnątrz {zpkPath} nie jest poprawnym JSON-em: {e.msg}")
+
+proc verifyZpkArchive*(zpkPath: string, publicKeyPath: string = ""): tuple[ok: bool, manifest: ZpkManifest, messages: seq[string]] =
+  ## `zpm verify <plik.zpk>` -- odpowiednik `zpk verify`, na wypadek gdy
+  ## operator ma pod ręką tylko `zpm` (albo instaluje pakiety zbudowane
+  ## przez `zpk` inną drogą niż `zpm install`). Rozpakowuje CAŁE archiwum
+  ## do katalogu tymczasowego, przelicza sha256 każdego pliku ładunku i
+  ## zagregowaną sumę od nowa (integralność), i jeśli manifest niesie
+  ## podpis -- weryfikuje go względem `publicKeyPath` (autentyczność).
+  var messages: seq[string] = @[]
+  var ok = true
+  let (gotManifest, manifest, err) = extractManifestFromArchive(zpkPath)
+  if not gotManifest:
+    return (false, ZpkManifest(), @[err])
+
+  let extractDir = getTempDir() / &"zpm-verify-{$epochTime().int}-{getCurrentProcessId()}"
+  createDir(extractDir)
+  defer: removeDir(extractDir)
+  let extractCode = execCmd(&"tar -C \"{extractDir}\" -xf \"{zpkPath}\"")
+  if extractCode != 0:
+    return (false, manifest, @[&"nie udało się rozpakować {zpkPath} do weryfikacji (kod {extractCode})"])
+
+  var recomputed: seq[ZpkFileEntry] = @[]
+  var mismatch = false
+  for entry in manifest.files:
+    let full = extractDir / entry.path
+    if not fileExists(full):
+      ok = false
+      mismatch = true
+      messages.add &"BRAK pliku zadeklarowanego w manifeście: {entry.path}"
+      continue
+    let actual = sha256sumOf(full)
+    recomputed.add ZpkFileEntry(path: entry.path, sha256: actual)
+    if actual != entry.sha256:
+      ok = false
+      mismatch = true
+      messages.add &"NIEZGODNOŚĆ sha256 pliku '{entry.path}': manifest={entry.sha256} obliczono={actual}"
+
+  if not mismatch:
+    if manifest.sha256.len == 0:
+      ok = false
+      messages.add "manifest nie zawiera zagregowanej sumy sha256"
+    else:
+      let actualAggregate = contentDigestOf(recomputed)
+      if actualAggregate != manifest.sha256:
+        ok = false
+        messages.add &"NIEZGODNOŚĆ zagregowanej sha256: manifest={manifest.sha256} obliczono={actualAggregate}"
+      else:
+        messages.add &"sha256 OK ({actualAggregate}, {manifest.files.len} plików)"
+
+  let pubKey = if publicKeyPath.len > 0: publicKeyPath else: getEnv("ZPK_VERIFY_KEY")
+  if manifest.signature.len > 0:
+    if pubKey.len == 0:
+      messages.add "pakiet ma podpis (manifest.signature), ale nie podano klucza publicznego " &
+        "(--pubkey albo ZPK_VERIFY_KEY) -- pomijam weryfikację podpisu"
+    elif mismatch:
+      messages.add "pomijam weryfikację podpisu -- zawartość już nie zgadza się z manifestem"
+    else:
+      let digestTmp = getTempDir() / &"zpm-verify-sign-{$epochTime().int}-{getCurrentProcessId()}.tmp"
+      writeFile(digestTmp, contentDigestInput(recomputed))
+      let (sigOk, sigErr) = verifyFile(digestTmp, pubKey, manifest.signature)
+      removeFile(digestTmp)
+      if sigOk:
+        messages.add "podpis OK -- autentyczność potwierdzona"
+      else:
+        ok = false
+        messages.add &"podpis NIEPRAWIDŁOWY -- {sigErr}"
+  else:
+    messages.add "pakiet nie jest podpisany (brak manifest.signature) -- zweryfikowano tylko integralność (sha256), nie autentyczność"
+
+  (ok, manifest, messages)
+
 # ---------------------------------------------------------------------------
 # Budowanie i pakowanie: recipe.janet -> staging dir -> archiwum .zpk
 # ---------------------------------------------------------------------------
-
-proc runRecipe(recipeDir, recipeFile, lang, stageDir: string,
-                extraEnv: openArray[(string, string)]): int =
-  let interp = case lang.toLowerAscii
-    of "", "janet": "janet"
-    else: lang
-  if findExe(interp).len == 0:
-    stderr.writeLine(&"[zpm:pack] ✘ Brak interpretera '{interp}' w PATH.")
-    return 127
-  for (k, v) in extraEnv:
-    putEnv(k, v)
-  log(&"[zpm:pack] $ (cwd={recipeDir}) {interp} {recipeFile}")
-  let p = startProcess(interp, workingDir = recipeDir, args = @[recipeDir / recipeFile],
-                        options = {poUsePath, poParentStreams})
-  result = p.waitForExit()
-  p.close()
-
-proc buildZpk*(recipeDir: string, name, version, arch: string,
-               dependsOn: seq[string], cfg: ZpmConfig,
-               recipeFile = "recipe.janet", lang = "janet"): tuple[ok: bool, path: string] =
-  ## Uruchamia `recipe.janet` w `recipeDir` z ZPM_PACKAGE_STAGE_DIR
-  ## wskazującym na świeży katalog roboczy -- recipe ma tam zostawić
-  ## dokładnie te pliki, które mają wylądować w systemie (względem "/").
-  ## Po udanym uruchomieniu tar.zst-uje staging dir + manifest.json do
-  ## `cfg.nativePackageOutDir/<name>-<version>-<arch>.zpk`.
-  let stageDir = getTempDir() / &"zpm-pack-{name}-{$epochTime().int}"
-  createDir(stageDir)
-  defer: removeDir(stageDir)
-
-  let code = runRecipe(recipeDir, recipeFile, lang, stageDir,
-                        [("ZPM_PACKAGE_STAGE_DIR", stageDir), ("ZPM_PACKAGE_NAME", name),
-                         ("ZPM_PACKAGE_VERSION", version), ("ZPM_PACKAGE_ARCH", arch)])
-  if code != 0:
-    stderr.writeLine(&"[zpm:pack] ✘ recipe '{recipeFile}' nie powiodło się (kod {code}).")
-    return (false, "")
-
-  var manifest = ZpkManifest(
-    name: name, version: version, arch: arch, dependsOn: dependsOn,
-    description: "", buildRecipe: recipeFile, builtAt: nowIso8601()
-  )
-  # Lista plików + sha256 KAŻDEGO z nich, POLICZONA PRZED dopisaniem
-  # manifest.json do stagingu (żeby manifest nie próbował hashować samego
-  # siebie) -- to jest to, czego brakowało do realnego `zpm remove` dla
-  # .zpk: bez tej listy nie ma jak wiedzieć, co dokładnie skasować.
-  for path in walkDirRec(stageDir):
-    let rel = path.relativePath(stageDir)
-    manifest.files.add ZpkFileEntry(path: rel, sha256: sha256sumOf(path))
-  writeFile(stageDir / ManifestFileName, manifestToJson(manifest).pretty())
-
-  createDir(cfg.nativePackageOutDir)
-  let outPath = cfg.nativePackageOutDir / packageFileName(manifest)
-  # tar (nie własny format archiwum) -- ten sam narzędziowy fundament co
-  # reszta zpm (sha256sum, git): mniej kodu do utrzymania niż własny
-  # (de)serializer archiwów, a `tar` jest wszędzie tam, gdzie jest `sh`.
-  let tarCode = execCmd(&"tar --numeric-owner --owner=0 --group=0 -C \"{stageDir}\" -acf \"{outPath}\" .")
-  if tarCode != 0:
-    stderr.writeLine(&"[zpm:pack] ✘ Pakowanie do {outPath} nie powiodło się (kod {tarCode}).")
-    return (false, "")
-
-  manifest.sha256 = sha256sumOf(outPath)
-  # Manifest z sumą samego .zpk ląduje OBOK archiwum (jawnie, do wglądu /
-  # do indeksu), niezależnie od kopii spakowanej w środku archiwum.
-  writeFile(outPath & ".json", manifestToJson(manifest).pretty())
-
-  log(&"[zpm:pack] ✔ {outPath} (sha256={manifest.sha256})")
-  (true, outPath)
 
 # ---------------------------------------------------------------------------
 # Indeks repozytorium (Packages.gz-owy odpowiednik) + instalacja z .zpk
@@ -163,31 +187,6 @@ proc loadRepoIndex*(path: string): ZpkRepoIndex =
         result.packages.add manifestFromJson(item)
   except CatchableError as e:
     stderr.writeLine(&"[zpm:native] Ostrzeżenie: nie udało się wczytać indeksu {path} ({e.msg}).")
-
-proc saveRepoIndex*(path: string, index: ZpkRepoIndex) =
-  createDir(parentDir(path))
-  var root = newJObject()
-  root["schema_version"] = %index.schemaVersion
-  var pkgs = newJArray()
-  for m in index.packages: pkgs.add manifestToJson(m)
-  root["packages"] = pkgs
-  writeFile(path, root.pretty())
-
-proc addToIndex*(cfg: ZpmConfig, manifest: ZpkManifest) =
-  ## Dopisuje/aktualizuje pakiet w LOKALNYM indeksie (`nativeRepoCacheDir/
-  ## index.json`) -- to jest to, co `zpm pack` robi automatycznie po
-  ## zbudowaniu, i co dałoby się potem opublikować (skopiować katalog
-  ## z .zpk + index.json na serwer HTTP) jako `nativeRepoIndexUrl`.
-  let indexPath = cfg.nativeRepoCacheDir / "index.json"
-  var index = loadRepoIndex(indexPath)
-  var replaced = false
-  for i, m in index.packages:
-    if m.name == manifest.name and m.version == manifest.version and m.arch == manifest.arch:
-      index.packages[i] = manifest
-      replaced = true
-      break
-  if not replaced: index.packages.add manifest
-  saveRepoIndex(indexPath, index)
 
 proc refreshNativeIndex*(cfg: ZpmConfig): bool =
   ## `zpm update`/`zpm refresh` odświeżają też indeks natywnego repo
@@ -304,10 +303,11 @@ proc removeNativeReceiptFile(cfg: ZpmConfig, name, rootPath: string) =
 
 proc installZpk*(zpkPath, rootPath: string, cfg: ZpmConfig, manifest: ZpkManifest): int =
   ## Rozpakowuje archiwum .zpk do `rootPath` (domyślnie "/") -- struktura
-  ## wewnątrz archiwum jest już względna wobec korzenia systemu (patrz
-  ## `ZPM_PACKAGE_STAGE_DIR` w `buildZpk`). Po sukcesie zapisuje
-  ## `ZpkInstallReceipt` (lista plików z manifestu) -- BEZ TEGO `zpm
-  ## remove` dla tego backendu nie ma jak wiedzieć, co dokładnie skasować.
+  ## wewnątrz archiwum jest już względna wobec korzenia systemu (kontrakt
+  ## `ZPM_PACKAGE_STAGE_DIR`, patrz `zpk build` w osobnym repo `zpk`). Po
+  ## sukcesie zapisuje `ZpkInstallReceipt` (lista plików z manifestu) --
+  ## BEZ TEGO `zpm remove` dla tego backendu nie ma jak wiedzieć, co
+  ## dokładnie skasować.
   if not fileExists(zpkPath):
     stderr.writeLine(&"[zpm:native] ✘ Brak pliku {zpkPath}.")
     return 1
@@ -317,9 +317,9 @@ proc installZpk*(zpkPath, rootPath: string, cfg: ZpmConfig, manifest: ZpkManifes
   if code != 0:
     stderr.writeLine(&"[zpm:native] ✘ Rozpakowanie {zpkPath} do {root} nie powiodło się (kod {code}).")
     return code
-  # `manifest.json` sam trafia do stagingu/archiwum (patrz buildZpk) --
-  # nie chcemy go liczyć jako "plik pakietu" do ewentualnego usunięcia
-  # razem z resztą (to metadane, nie zawartość pakietu).
+  # `manifest.json` sam trafia do stagingu/archiwum przy budowaniu (patrz
+  # `zpk build`) -- nie chcemy go liczyć jako "plik pakietu" do
+  # ewentualnego usunięcia razem z resztą (to metadane, nie zawartość pakietu).
   var files: seq[ZpkFileEntry] = @[]
   for f in manifest.files:
     if f.path != ManifestFileName: files.add f
@@ -330,32 +330,69 @@ proc installZpk*(zpkPath, rootPath: string, cfg: ZpmConfig, manifest: ZpkManifes
   log(&"[zpm:native] ✔ Zainstalowano {zpkPath.extractFilename} (root={root}, {files.len} plików).")
   0
 
+proc verifyAndReport(cfg: ZpmConfig, path: string): tuple[ok: bool, manifest: ZpkManifest] =
+  ## Pełna weryfikacja PRZED instalacją: integralność (per-plik + suma
+  ## zagregowana) ZAWSZE, autentyczność JEŚLI pakiet podpisany i
+  ## `native.verify_pubkey` skonfigurowane, twarde odrzucenie nieopisanych
+  ## pakietów JEŚLI `native.require_signature=true`.
+  let (ok, manifest, messages) = verifyZpkArchive(path, cfg.nativeVerifyPubkey)
+  for msg in messages:
+    logVerbose(&"[zpm:native] {msg}")
+  if not ok:
+    for msg in messages:
+      stderr.writeLine(&"[zpm:native] ✘ {path}: {msg}")
+    return (false, manifest)
+  if manifest.signature.len == 0 and cfg.nativeRequireSignature:
+    stderr.writeLine(&"[zpm:native] ✘ {path}: pakiet NIE jest podpisany, a native.require_signature=true -- odmawiam instalacji.")
+    return (false, manifest)
+  if manifest.signature.len > 0 and cfg.nativeVerifyPubkey.len == 0:
+    log(&"[zpm:native] ⚠ {path}: pakiet ma podpis, ale native.verify_pubkey nie jest skonfigurowane -- zainstalowano na podstawie samej integralności (sha256), BEZ potwierdzenia autentyczności.")
+  (true, manifest)
+
 proc installNative*(cfg: ZpmConfig, name, rootPath: string): int =
-  let (found, manifest) = findManifest(cfg, name)
+  let (found, indexManifest) = findManifest(cfg, name)
   if not found:
     log(&"[zpm:native] Pakiet '{name}' nie występuje w lokalnym indeksie. Spróbuj `zpm update` / `zpm refresh` najpierw.")
     return 1
-  let cachedPath = cfg.nativeRepoCacheDir / packageFileName(manifest)
+  let cachedPath = cfg.nativeRepoCacheDir / packageFileName(indexManifest)
   if not fileExists(cachedPath):
     if cfg.offlineMode:
       log(&"[zpm:native] ✘ [offline] Brak {cachedPath} w cache'u, a sieć jest wyłączona.")
       return 1
     # URL pakietu = katalog indeksu + nazwa pliku (konwencja jak przy APT: Packages + pool/).
     let base = cfg.nativeRepoIndexUrl.rsplit('/', maxsplit = 1)[0]
-    let url = base & "/" & packageFileName(manifest)
+    let url = base & "/" & packageFileName(indexManifest)
     log(&"[zpm:native] Pobieram {url} ...")
     createDir(cfg.nativeRepoCacheDir)
     let (dlOk, dlErr) = safeDownloadFile(url, cachedPath, cfg, "zpm:native")
     if not dlOk:
       stderr.writeLine(&"[zpm:native] ✘ Pobieranie nie powiodło się: {dlErr}")
       return 1
-    if manifest.sha256.len > 0:
-      let got = sha256sumOf(cachedPath)
-      if got != manifest.sha256:
-        stderr.writeLine(&"[zpm:native] ✘ Suma sha256 nie zgadza się dla {name} (oczekiwano {manifest.sha256}, otrzymano {got}) -- usuwam.")
-        removeFile(cachedPath)
-        return 1
+  # v0.4 -- integralność NIE jest już "sha256 całego pliku .zpk zgodny z
+  # indeksem" (indeks niesie sumę ZAWARTOŚCI, nie bajtów archiwum -- patrz
+  # `contentDigestOf`); zamiast tego archiwum jest w pełni weryfikowane
+  # (per-plik + suma zagregowana + PODPIS, jeśli obecny) dokładnie tak
+  # samo jak przez `zpm verify` / `zpk verify`.
+  let (verifyOk, manifest) = verifyAndReport(cfg, cachedPath)
+  if not verifyOk:
+    removeFile(cachedPath)
+    return 1
   installZpk(cachedPath, rootPath, cfg, manifest)
+
+proc installLocalZpk*(zpkPath, rootPath: string, cfg: ZpmConfig): int =
+  ## v0.4 -- instalacja BEZPOŚREDNIO z lokalnego pliku `.zpk` (np. `zpm
+  ## install ./moj-pakiet-1.0.0-x86_64.zpk`), BEZ przechodzenia przez
+  ## indeks repozytorium -- wcześniej jedyną drogą do zainstalowania
+  ## czegokolwiek natywnego było `zpm install <nazwa>` po `zpm update`
+  ## (indeks musiał już znać pakiet), więc pakiet zbudowany przez `zpk`
+  ## (osobne narzędzie, jedyne, które faktycznie BUDUJE `.zpk`) albo
+  ## pobrany ręcznie skądinąd nie dał się zainstalować wprost.
+  ## Manifest wyciągany jest Z ARCHIWUM (v0.4, patrz `extractManifestFromArchive`),
+  ## nie z osobnego pliku obok -- ten sam kontrakt co `zpm verify`.
+  let (verifyOk, manifest) = verifyAndReport(cfg, zpkPath)
+  if not verifyOk:
+    return 1
+  installZpk(zpkPath, rootPath, cfg, manifest)
 
 proc removeNative*(cfg: ZpmConfig, name, rootPath: string): int =
   ## Realne usuwanie pakietu `.zpk` -- dokładnie te pliki, które
