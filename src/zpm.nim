@@ -12,7 +12,7 @@ else:
   import ./zpmpkg/building
   import ./zpmpkg/zpk
 
-const ZpmVersion = "0.4.0"
+const ZpmVersion = "0.2.0"
 
 proc printBanner() =
   when defined(atomic):
