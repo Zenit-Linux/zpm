@@ -1,4 +1,4 @@
-version       = "0.3.0"
+version       = "0.2.0"
 author        = "Zenit Linux Developers"
 description   = "Zenit Package Manager (zpm) — inteligentny orkiestrator pakietów dla Zenit Linux"
 license       = "Apache-2.0"
@@ -8,7 +8,6 @@ binDir        = "bin"
 
 requires "nim >= 2.0.0"   # v0.2: podniesione z 1.6.0 -- kod używa std/envvars (2.0+) i
                           # db_connector wymaga >= 1.7.3; deklarowanie 1.6.0 było nieprawdziwe.
-requires "hcl_nim >= 0.1"
 requires "db_connector >= 0.1.0"
 
 # --- Zadania pomocnicze -----------------------------------------------
