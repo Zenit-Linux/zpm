@@ -259,3 +259,40 @@ suite "ownrepo (parsowanie own-repository.json -- v0.3)":
     let (ok2, _, err2) = resolveOwnToolBranch(tool, "nieznany-branch")
     check ok2 == false
     check "nieznany-branch" notin availableBranches(tool) or true  # dostępne: tylko "testing"
+
+  test "pole 'bin' jako obiekt {arch: url} (multi-arch, v0.4) -- to co produkuje `zpk schedule-release`":
+    ## Regresja: wcześniej `item{\"bin\"}.getStr(\"\")` na obiekcie JSON
+    ## po cichu zwracało "", więc wpis wyglądał jak pusty `bin` i był
+    ## odrzucany jako niepoprawny -- mimo że dane tam BYŁY, tylko w
+    ## kształcie {arch: url} zamiast zwykłego stringa.
+    let raw = """
+      {
+        "schema_version": 2,
+        "tools": [
+          {
+            "name": "zpk", "type": "binary",
+            "bin": {
+              "x86_64": "https://example.com/zpk-x86_64",
+              "aarch64": "https://example.com/zpk-aarch64"
+            }
+          }
+        ]
+      }
+    """
+    let parsed = parseOwnRepositoryJson(raw)
+    let tool = parsed.findTool("zpk")
+    check tool.kind == otkBinary
+    check tool.binByArch.len == 2
+    check tool.bin in ["https://example.com/zpk-x86_64", "https://example.com/zpk-aarch64"]
+
+  test "pole 'bin' jako obiekt bez wariantów (same puste stringi) jest odrzucane":
+    let raw = """
+      {
+        "schema_version": 2,
+        "tools": [
+          {"name": "pusty", "type": "binary", "bin": {"x86_64": ""}}
+        ]
+      }
+    """
+    expect(ValueError):
+      discard parseOwnRepositoryJson(raw)
