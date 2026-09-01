@@ -1,9 +1,11 @@
 #!/usr/bin/env janet
 
 (def out-dir "bin")
-(def src-file "src/zlb.nim")
+(def src-file "src/zpm.nim")
 
 (defn sh
+  "Uruchamia polecenie powłoki, wypisuje je najpierw, i wychodzi z błędem
+  jeśli zwróci kod różny od zera."
   [cmd]
   (print "$ " cmd)
   (def code (os/execute ["/bin/sh" "-c" cmd] :p))
@@ -13,31 +15,27 @@
 
 (defn ensure-out-dir [] (os/mkdir out-dir))
 
-# NAPRAWIONE: `-d:ssl` usunięte z obu poniższych zadań. Historycznie zlb
-# było budowane z `-d:ssl`, bo `zlbpkg/tools.nim` pobierało `zpm`/`installer`
-# przez `std/httpclient`, które potrafi obsłużyć HTTPS TYLKO gdy binarka
-# jest skompilowana z tą flagą -- inaczej w runtime leci "SSL support is
-# not available. Cannot connect over SSL. Compile with -d:ssl to enable."
-# (dokładnie ten błąd, na który trafiali użytkownicy bez OpenSSL na
-# maszynie budującej). `tools.nim` NIE używa już `std/httpclient` -- wywołuje
-# `curl`/`wget` jako podproces właśnie po to, żeby zlb nie musiało wymagać
-# OpenSSL w ogóle. `-d:ssl` w tych zadaniach było więc martwym, niepotrzebnym
-# wymaganiem: zostawione tutaj, dalej wymuszało (na niektórych systemach)
-# obecność OpenSSL tylko po to, żeby zlinkować binarkę, która i tak go
-# nigdy nie używa. Jeśli w przyszłości jakiś moduł zlb faktycznie zacznie
-# używać `std/httpclient`, tę flagę trzeba będzie przywrócić.
-(defn task-release []
+(defn task-standard []
   (ensure-out-dir)
-  (sh (string "nim c -d:release --opt:speed --out:" out-dir "/zlb " src-file))
-  (print "-> " out-dir "/zlb"))
+  (sh (string "nim c --threads:on -d:release -d:ssl --opt:speed --out:" out-dir "/zpm " src-file))
+  (print "-> " out-dir "/zpm (tryb standardowy)"))
+
+(defn task-atomic []
+  (ensure-out-dir)
+  (sh (string "nim c -d:release -d:ssl -d:atomic --opt:speed --out:" out-dir "/zpm-atomic " src-file))
+  (print "-> " out-dir "/zpm-atomic (tryb atomowy)"))
 
 (defn task-debug []
   (ensure-out-dir)
-  (sh (string "nim c --out:" out-dir "/zlb-debug " src-file))
-  (print "-> " out-dir "/zlb-debug"))
+  (sh (string "nim c --threads:on -d:ssl --out:" out-dir "/zpm-debug " src-file))
+  (print "-> " out-dir "/zpm-debug (debug)"))
 
 (defn task-check []
-  (sh (string "nim check " src-file)))
+  (sh (string "nim check --threads:on " src-file)))
+
+(defn task-all []
+  (task-standard)
+  (task-atomic))
 
 (defn task-clean []
   (sh (string "rm -rf " out-dir " nimcache nimblecache")))
@@ -50,33 +48,40 @@
     "unknown"))
 
 (defn detect-arch []
+  # os/arch nie istnieje w rdzennym Janecie -- opieramy się na `uname -m`,
+  # spójnie z tym, jak zlbpkg/crosscompile.nim w zlb rozpoznaje architekturę.
   (def p (os/spawn ["uname" "-m"] :p {:out :pipe}))
   (def out (string/trim (:read (p :out) :all)))
   (os/proc-wait p)
   out)
 
-(defn task-package [version]
-  (task-release)
+(defn task-release [version]
+  (task-all)
   (def osname (detect-os))
   (def arch (detect-arch))
-  (def name (string out-dir "/zlb-" osname "-" arch))
-  (sh (string "cp " out-dir "/zlb " name))
-  (sh (string "sha256sum " name " > " out-dir "/SHA256SUMS-" version))
-  (print "package " version " gotowy: " name))
+  (def std-name (string out-dir "/zpm-" osname "-" arch))
+  (def atomic-name (string out-dir "/zpm-atomic-" osname "-" arch))
+  (sh (string "cp " out-dir "/zpm " std-name))
+  (sh (string "cp " out-dir "/zpm-atomic " atomic-name))
+  (sh (string "sha256sum " std-name " " atomic-name " > " out-dir "/SHA256SUMS-" version))
+  (print "release " version " gotowy w " out-dir "/ (" std-name ", " atomic-name ")"))
 
 (defn main [&opt task & args]
   (case task
-    "release" (task-release)
+    "standard" (task-standard)
+    "atomic" (task-atomic)
     "debug" (task-debug)
     "check" (task-check)
+    "all" (task-all)
     "clean" (task-clean)
-    "package" (task-package (or (first args) "dev"))
-    nil (task-release)
+    "release" (task-release (or (first args) "dev"))
+    nil (task-all)
     (do
       (eprint "Nieznane zadanie: " task)
-      (eprint "Użycie: janet build.janet <release|debug|check|clean|package [wersja]>")
+      (eprint "Użycie: janet build.janet <standard|atomic|debug|check|all|clean|release [wersja]>")
       (os/exit 1))))
 
+# `janet build.janet <task> [args...]` -- (dyn :args) to [skrypt task args...]
 (let [all-args (or (dyn :args) @[])
       task (get all-args 1)
       rest-args (array/slice all-args 2)]
