@@ -11,7 +11,21 @@ import ./netutil
 import ./containerengine
 
 const DefaultOwnRepoPath* = "/etc/zpm/custom/own-repository.json"
-const DefaultOwnRepoUrl* = "https://raw.githubusercontent.com/Zenit-Linux/own-repository/main/repo/own-repository.json"
+const DefaultOwnRepoUrl* =
+  "https://raw.githubusercontent.com/Zenit-Linux/own-repository/main/repo/own-repository.json"
+  ## NAPRAWIONE: wcześniej wskazywało na "Zenit-Linux/zpm/main/custom/
+  ## own-repository.json" -- czyli plik `custom/own-repository.json`
+  ## WEWNĄTRZ repo `zpm`. To repo/ścieżka nigdy nie istniały (żadnego
+  ## takiego pliku tam nie ma i nigdy nie było) -- kanoniczne źródło to
+  ## OSOBNE repo `Zenit-Linux/own-repository`, plik `repo/own-repository.json`
+  ## (dokładnie ta konwencja, której `zpk schedule-release` używa do
+  ## PUBLIKOWANIA wpisów -- patrz zpk/src/zpkpkg/manifest.nim,
+  ## `repo = "https://github.com/Zenit-Linux/own-repository"`,
+  ## `repoFile = "repo/own-repository.json"`). Efekt starego URL-a: `zpm
+  ## refresh`/auto-refresh zawsze dostawał 404 (ciche niepowodzenie --
+  ## `refreshOwnRepository` po prostu zwracał false i zostawiał pustą/
+  ## nieistniejącą lokalną kopię), więc ekosystem `own` (zpm, installer,
+  ## kernel, ...) nigdy nie był rozpoznawany na świeżej maszynie.
 const SupportedOwnSchemaVersions = [1, 2]
   ## Wersje `schema_version` z custom/own-repository.json, które ten zpm
   ## UMIE poprawnie zinterpretować. Nowszy plik (przyszła migracja formatu)
