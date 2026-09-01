@@ -9,6 +9,7 @@ binDir        = "bin"
 requires "nim >= 2.0.0"   # v0.2: podniesione z 1.6.0 -- kod używa std/envvars (2.0+) i
                           # db_connector wymaga >= 1.7.3; deklarowanie 1.6.0 było nieprawdziwe.
 requires "db_connector >= 0.1.0"
+requires "hcl_nim >= 0.1"
 
 # --- Zadania pomocnicze -----------------------------------------------
 # Preferowanym sposobem budowania jest teraz `janet build.janet <task>`
