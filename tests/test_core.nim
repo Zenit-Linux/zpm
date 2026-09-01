@@ -7,6 +7,61 @@ import ../src/zpmpkg/stagingsafety
 import ../src/zpmpkg/backends/apt
 import ../src/zpmpkg/backends/dnf
 import ../src/zpmpkg/ownrepo
+import ../src/zpmpkg/building
+
+suite "building.parsePackageSpec (format wysyłany przez zlbpkg/zpm.nim -> entryArg)":
+  test "sama nazwa -> backend/wariant/opis puste":
+    let s = building.parsePackageSpec("curl")
+    check s.name == "curl"
+    check s.backend == ""
+    check s.variant == ""
+    check s.description == ""
+
+  test "nazwa -> backend (2 segmenty)":
+    let s = building.parsePackageSpec("systemd -> apt")
+    check s.name == "systemd"
+    check s.backend == "apt"
+    check s.variant == ""
+
+  test "nazwa@backend (składnia CLI)":
+    let s = building.parsePackageSpec("systemd@apt")
+    check s.name == "systemd"
+    check s.backend == "apt"
+
+  test "nazwa -> backend -> wariant (3 segmenty, np. branch dla 'own')":
+    let s = building.parsePackageSpec("kernel -> own -> stable")
+    check s.name == "kernel"
+    check s.backend == "own"
+    check s.variant == "stable"
+    check s.description == ""
+
+  test "REGRESJA: nazwa -> backend : opis -- opis NIE może wylądować w backendzie":
+    # Dokładnie to, co produkuje entryArg() w zlbpkg/zpm.nim dla pakietu
+    # `own` z opisem, np. package "zpm" { backend = "own" description = "..." }
+    # -- to jest DOKŁADNIE wpis, który wcześniej dawał
+    # "Nieznany backend budowania: own : Zenit Package Manager -- ...".
+    let s = building.parsePackageSpec("zpm -> own : Zenit Package Manager -- wbudowany, domyślny")
+    check s.name == "zpm"
+    check s.backend == "own"
+    check s.variant == ""
+    check s.description == "Zenit Package Manager -- wbudowany, domyślny"
+
+  test "REGRESJA: nazwa -> backend -> wariant : opis (4 segmenty razem)":
+    let s = building.parsePackageSpec(
+      "kernel -> own -> stable : domyślne jądro Linux (branch: stable; dostępne też: rolling)")
+    check s.name == "kernel"
+    check s.backend == "own"
+    check s.variant == "stable"
+    check s.description == "domyślne jądro Linux (branch: stable; dostępne też: rolling)"
+
+suite "ownrepo.DefaultOwnRepoUrl":
+  test "wskazuje na oficjalne repo Zenit-Linux/own-repository, nie na zpm":
+    # REGRESJA: wcześniej wskazywało na
+    # "Zenit-Linux/zpm/main/custom/own-repository.json" -- plik/repo, które
+    # nigdy nie istniały, więc auto-refresh zawsze dostawał 404.
+    check "Zenit-Linux/own-repository" in ownrepo.DefaultOwnRepoUrl
+    check "repo/own-repository.json" in ownrepo.DefaultOwnRepoUrl
+    check "Zenit-Linux/zpm/" notin ownrepo.DefaultOwnRepoUrl
 
 ## v0.2 -- zamyka lukę "Testy i CI -- zero". Nie próbuje pokryć CAŁEGO
 ## zpm (to wymagałoby mockowania apt/dnf/git/gpg/systemd-run itd.) --
