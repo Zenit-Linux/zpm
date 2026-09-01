@@ -1,4 +1,4 @@
-import std/[os, osproc, strformat, strutils, times]
+import std/[os, osproc, posix, strformat, strutils, tables, times]
 import ./types
 import ./config
 import ./ownrepo
@@ -13,19 +13,51 @@ type
     logPath*: string
 
 proc parsePackageSpec*(raw: string): PackageSpec =
-  ## Rozbija wpis pakietu na nazwę + opcjonalny wymuszony backend.
+  ## Rozbija wpis pakietu na nazwę + opcjonalny wymuszony backend +
+  ## opcjonalny wariant (branch/dystrybucja) + opcjonalny opis.
   ## Obsługiwane składnie (patrz modules/*/package.list w zlb):
-  ##   systemd            -> PackageSpec(name: "systemd", backend: "")
-  ##   systemd -> apt      -> PackageSpec(name: "systemd", backend: "apt")
-  ##   systemd@apt          -> to samo, wygodne z linii poleceń
+  ##   systemd                          -> backend/variant puste (auto)
+  ##   systemd -> apt                   -> backend="apt"
+  ##   systemd@apt                      -> to samo, wygodne z linii poleceń
+  ##   kernel -> own -> testing         -> backend="own", variant="testing"
+  ##   git -> apt -> debian.testing     -> backend="apt", variant="debian.testing"
+  ##   kernel -> own : opis pakietu     -> description="opis pakietu"
+  ##
+  ## NAPRAWIONE: wcześniej ta funkcja rozumiała TYLKO "nazwa -> backend"
+  ## (dwa segmenty) -- każdy trzeci segment (wariant) i opis po ":" trafiały
+  ## w całości do pola `backend`, więc wpis wysyłany przez zlbpkg/zpm.nim
+  ## (`entryArg`, format "nazwa -> backend -> wariant : opis", DOKŁADNIE
+  ## to, co produkują package.list-y w zlb dla pakietów `own`) kończył się
+  ## jako np. backend = "own : Zenit Package Manager -- wbudowany,
+  ## domyślny" -- string, który żaden `case` niżej oczywiście nie rozpozna
+  ## ("Nieznany backend budowania: own : ..."). Teraz zachowanie jest
+  ## IDENTYCZNE z `parsePackageSpec` w orchestrator.nim (ten sam wire
+  ## format, dwie niezależne implementacje -- muszą się zgadzać).
   var s = raw.strip()
+
+  var description = ""
+  let colonIdx = s.find(':')
+  if colonIdx >= 0:
+    description = s[colonIdx+1 ..< s.len].strip()
+    s = s[0 ..< colonIdx].strip()
+
   if "->" in s:
-    let parts = s.split("->", maxsplit = 1)
-    return PackageSpec(name: parts[0].strip(), backend: parts[1].strip().toLowerAscii)
+    let parts = s.split("->")
+    case parts.len
+    of 2:
+      return PackageSpec(name: parts[0].strip(), backend: parts[1].strip().toLowerAscii,
+                          variant: "", description: description)
+    else:
+      # 3 lub więcej "->" -- pierwsze dwa to nazwa/backend, RESZTA
+      # (zjednoczona z powrotem przez "->") to wariant.
+      let variant = parts[2..^1].join("->").strip()
+      return PackageSpec(name: parts[0].strip(), backend: parts[1].strip().toLowerAscii,
+                          variant: variant, description: description)
   if '@' in s and not s.startsWith("@"):
     let parts = s.rsplit('@', maxsplit = 1)
-    return PackageSpec(name: parts[0].strip(), backend: parts[1].strip().toLowerAscii)
-  PackageSpec(name: s, backend: "")
+    return PackageSpec(name: parts[0].strip(), backend: parts[1].strip().toLowerAscii,
+                        variant: "", description: description)
+  PackageSpec(name: s, backend: "", variant: "", description: description)
 
 proc toSpecs(raw: seq[string]): seq[PackageSpec] =
   result = @[]
@@ -41,26 +73,93 @@ proc logLine(path, msg: string) =
   defer: f.close()
   f.writeLine(&"[{$now()}] {msg}")
 
-proc installIntoRootWithBackend(rootPath, backend, pkg: string, cfg: ZpmConfig): int =
+proc loadOwnRepositoryAutoRefresh(cfg: ZpmConfig): OwnRepository =
+  ## `loadOwnRepository` sama w sobie jest CZYSTO lokalna -- pusty/
+  ## brakujący `custom/own-repository.json` (dokładnie stan świeżej
+  ## maszyny, na której nikt jeszcze nie odpalił `zpm refresh`) po cichu
+  ## daje pustą listę narzędzi, więc PIERWSZY build na czystej maszynie
+  ## zawsze wywalał się na "nieznane narzędzie 'X'", mimo że narzędzie
+  ## FAKTYCZNIE istnieje w oficjalnym repo (patrz DefaultOwnRepoUrl w
+  ## ownrepo.nim: https://raw.githubusercontent.com/Zenit-Linux/
+  ## own-repository/main/repo/own-repository.json). Zamiast wymagać
+  ## ręcznego kroku pośredniego, PRÓBUJEMY automatycznego odświeżenia
+  ## dokładnie w tej sytuacji (pusta/brakująca lokalna kopia) -- jeśli się
+  ## nie uda (offline, brak sieci), po prostu zostajemy z pustym repo tak
+  ## jak dotychczas i wołający dostaje zwykły błąd "nieznane narzędzie".
+  result = loadOwnRepository(cfg.customRepoPath)
+  if result.tools.len == 0:
+    log("[zpm --building] custom/own-repository.json puste/brak lokalnie -- " &
+      "próbuję automatycznego 'zpm refresh' z domyślnego repo...")
+    if refreshOwnRepository(cfg):
+      result = loadOwnRepository(cfg.customRepoPath)
+
+proc runningAsRoot(): bool =
+  when defined(posix): getuid() == 0
+  else: false
+
+proc runPrivileged(cmd: string): int =
+  ## Woła `cmd`, poprzedzając je `sudo` TYLKO jeśli (a) proces NIE działa
+  ## już jako root ORAZ (b) `sudo` w ogóle jest dostępne w PATH.
+  ##
+  ## NAPRAWIONE: wcześniej każda komenda menedżera pakietów (apt/dnf/
+  ## pacman/zypper) była bezwarunkowo poprzedzana `sudo `. `zlb build
+  ## rootfs` (i CI budujące obrazy w kontenerach) niemal zawsze działa
+  ## JUŻ jako root -- w takich obrazach `sudo` bywa świadomie w ogóle
+  ## niezainstalowane (niepotrzebne, gdy i tak jest się rootem), co dawało
+  ## "sh: 1: sudo: not found" i przerywało KAŻDĄ instalację przez te
+  ## backendy, mimo że proces miał już pełne prawa do wykonania komendy
+  ## bezpośrednio.
+  let prefix = if runningAsRoot() or findExe("sudo").len == 0: "" else: "sudo "
+  execCmd(prefix & cmd)
+
+proc runInChroot(rootPath, cmd: string): int =
+  ## Uruchamia `cmd` WEWNĄTRZ `rootPath` przez `chroot` -- używane dla
+  ## menedżerów, które (w przeciwieństwie do apt/dnf/pacman/zypper) NIE
+  ## mają natywnej flagi "zainstaluj do INNEGO systemu plików"
+  ## (--root/--installroot): flatpak/snap/cargo/pip/npm same w sobie
+  ## zawsze instalują "tu, gdzie są uruchomione". Zakłada, że `rootPath`
+  ## ma już zainstalowany interpreter/binarkę danego menedżera (np. przez
+  ## wcześniejszy pakiet z backendu `apt` w TEJ SAMEJ liście modułu) --
+  ## jeśli nie, `chroot`/powłoka i tak zwrócą czytelny błąd "not found"
+  ## zamiast mylącego "Nieznany backend budowania".
+  if not dirExists(rootPath):
+    log(&"[zpm --building] ✘ katalog docelowy '{rootPath}' nie istnieje -- nie mogę chrootować")
+    return 1
+  if findExe("chroot").len == 0:
+    log("[zpm --building] ✘ brak polecenia 'chroot' w PATH -- wymagane dla tego backendu w trybie budowania")
+    return 1
+  runPrivileged(&"chroot {quoteShell(rootPath)} /bin/sh -c {quoteShell(cmd)}")
+
+proc installIntoRootWithBackend(rootPath: string, spec: PackageSpec, cfg: ZpmConfig): int =
   ## Deleguje instalację "per-pakiet" do menedżera bazowego, ale z flagą
   ## roota/sysroota, tak żeby nic nie trafiło na system, na którym
-  ## budujemy obraz. Wspiera także `own` (ekosystem Zenit, bez curl) i
-  ## `brew` (Linuxbrew z prefiksem w roocie obrazu).
-  case backend
+  ## budujemy obraz.
+  let pkg = spec.name
+  case spec.backend
   of "apt":
-    result = execCmd(&"sudo apt install -y --root={rootPath} {pkg}")
+    result = runPrivileged(&"apt install -y --root={rootPath} {pkg}")
   of "dnf":
-    result = execCmd(&"sudo dnf install -y --installroot={rootPath} {pkg}")
+    result = runPrivileged(&"dnf install -y --installroot={rootPath} {pkg}")
   of "pacman":
-    result = execCmd(&"sudo pacman -S --noconfirm --root {rootPath} {pkg}")
+    result = runPrivileged(&"pacman -S --noconfirm --root {rootPath} {pkg}")
   of "zypper":
-    result = execCmd(&"sudo zypper --root {rootPath} install -y {pkg}")
+    result = runPrivileged(&"zypper --root {rootPath} install -y {pkg}")
   of "brew":
     # Linuxbrew do sysroota obrazu: instalujemy do własnego prefiksu
     # osadzonego pod rootPath/opt/homebrew, żeby nie dotykać hosta.
     let brewPrefix = rootPath / "opt" / "homebrew"
     createDir(brewPrefix)
     result = execCmd(&"HOMEBREW_PREFIX={brewPrefix} brew install --appdir={brewPrefix} {pkg}")
+  of "flatpak":
+    result = runInChroot(rootPath, &"flatpak install -y flathub {pkg}")
+  of "snap":
+    result = runInChroot(rootPath, &"snap install {pkg}")
+  of "cargo":
+    result = runInChroot(rootPath, &"cargo install {pkg}")
+  of "pip":
+    result = runInChroot(rootPath, &"pip install {pkg}")
+  of "npm":
+    result = runInChroot(rootPath, &"npm install -g {pkg}")
   of "own":
     # Ekosystem Zenit -- narzędzia typu `binary` lądują wprost w
     # <root>/usr/local/bin (bez jednego wywołania curl); narzędzia typu
@@ -68,14 +167,19 @@ proc installIntoRootWithBackend(rootPath, backend, pkg: string, cfg: ZpmConfig):
     # (install.<lang>) z ZPM_INSTALL_ROOT=<root>, więc trafiają do
     # gotowego obrazu, nigdy do hosta, na którym budujemy. Instalacja
     # jest ŚWIADOMA `depends_on` (patrz deps.nim) -- dokładnie to, czego
-    # potrzebuje builder (zlb) do własnego pipeline'u stage0/1/2: on
-    # decyduje KIEDY woła zpm dla którego etapu, a zpm w obrębie
-    # POJEDYNCZEGO wywołania gwarantuje poprawną kolejność zależności.
-    let repo = loadOwnRepository(cfg.customRepoPath)
+    # potrzebuje builder (zlb) do własnego pipeline'u stage0/1/2.
+    let repo = loadOwnRepositoryAutoRefresh(cfg)
     let destDir = rootPath / "usr" / "local" / "bin"
-    result = if installManyOwn(repo, cfg, @[pkg], destDir, rootPath): 0 else: 1
+    # NAPRAWIONE: `spec.variant` (branch, np. "own -> stable") był
+    # dotychczas po cichu odrzucany -- `kernel -> own -> stable` instalowało
+    # zawsze branch DOMYŚLNY zamiast tego, co jawnie zażyczono w
+    # package.list. orchestrator.nim robi to poprawnie (patrz `branchFor`
+    # tamże) -- tu naprawiamy dokładnie to samo dla trybu budowania.
+    var branchFor = initTable[string, string]()
+    if spec.variant.len > 0: branchFor[pkg] = spec.variant
+    result = if installManyOwn(repo, cfg, @[pkg], destDir, rootPath, false, branchFor): 0 else: 1
   else:
-    log(&"[zpm --building] Nieznany backend budowania: {backend}")
+    log(&"[zpm --building] Nieznany backend budowania: {spec.backend}")
     result = 1
 
 proc runBuilding*(cfg: ZpmConfig, rootPath, backend: string, rawPackages: seq[string]) =
@@ -100,8 +204,11 @@ proc runBuilding*(cfg: ZpmConfig, rootPath, backend: string, rawPackages: seq[st
   var failed: seq[string] = @[]
   for spec in target.packages:
     let pkgBackend = if spec.backend.len > 0: spec.backend else: effectiveBackend
-    log(&"[zpm --building] -> instaluję {spec.name} (backend: {pkgBackend}) do {rootPath}")
-    let code = installIntoRootWithBackend(rootPath, pkgBackend, spec.name, cfg)
+    let effectiveSpec = PackageSpec(name: spec.name, backend: pkgBackend,
+                                     variant: spec.variant, description: spec.description)
+    let variantSuffix = if spec.variant.len > 0: &" [wariant: {spec.variant}]" else: ""
+    log(&"[zpm --building] -> instaluję {spec.name} (backend: {pkgBackend}){variantSuffix} do {rootPath}")
+    let code = installIntoRootWithBackend(rootPath, effectiveSpec, cfg)
     logLine(logPath, &"install {spec.name}@{pkgBackend} -> exit={code}")
     if code != 0:
       failed.add(spec.name & "@" & pkgBackend)
@@ -134,8 +241,9 @@ proc runBuildingInit*(cfg: ZpmConfig, rootPath, trustKeysPath: string) =
         log(&"[zpm --root {rootPath}] ✘ {trustKeysPath} nie zawierał rozpoznanego fingerprintu/klucza")
     else:
       log(&"[zpm --root {rootPath}] ostrzeżenie: brak pliku kluczy {trustKeysPath}")
-  let repo = loadOwnRepository(cfg.customRepoPath)
+  let repo = loadOwnRepositoryAutoRefresh(cfg)
   log(&"[zpm --root {rootPath}] ekosystem 'own': {repo.tools.len} narzędzi dostępnych")
+
 proc runBuildingRemove*(cfg: ZpmConfig, rootPath, backend: string, rawPackages: seq[string]) =
   if rawPackages.len == 0: return
   let effectiveBackend = if backend.len > 0: backend else: cfg.defaultBuildingBackend
@@ -144,16 +252,23 @@ proc runBuildingRemove*(cfg: ZpmConfig, rootPath, backend: string, rawPackages: 
     let pkgBackend = if spec.backend.len > 0: spec.backend else: effectiveBackend
     log(&"[zpm --root {rootPath}] usuwam {spec.name} (backend: {pkgBackend})")
     case pkgBackend
-    of "apt": discard execCmd(&"sudo apt remove -y --root={rootPath} {spec.name}")
-    of "dnf": discard execCmd(&"sudo dnf remove -y --installroot={rootPath} {spec.name}")
-    of "pacman": discard execCmd(&"sudo pacman -R --noconfirm --root {rootPath} {spec.name}")
-    of "zypper": discard execCmd(&"sudo zypper --root {rootPath} remove -y {spec.name}")
+    of "apt": discard runPrivileged(&"apt remove -y --root={rootPath} {spec.name}")
+    of "dnf": discard runPrivileged(&"dnf remove -y --installroot={rootPath} {spec.name}")
+    of "pacman": discard runPrivileged(&"pacman -R --noconfirm --root {rootPath} {spec.name}")
+    of "zypper": discard runPrivileged(&"zypper --root {rootPath} remove -y {spec.name}")
+    of "flatpak": discard runInChroot(rootPath, &"flatpak uninstall -y {spec.name}")
+    of "snap": discard runInChroot(rootPath, &"snap remove {spec.name}")
+    of "cargo": discard runInChroot(rootPath, &"cargo uninstall {spec.name}")
+    of "pip": discard runInChroot(rootPath, &"pip uninstall -y {spec.name}")
+    of "npm": discard runInChroot(rootPath, &"npm uninstall -g {spec.name}")
     of "own":
       let repo = loadOwnRepository(cfg.customRepoPath)
       discard removeOwn(repo, spec.name, cfg, rootPath / "usr" / "local" / "bin", rootPath)
     else: log(&"[zpm --root {rootPath}] nieznany backend do usuwania: {pkgBackend}")
+
 proc runBuildingSync*(cfg: ZpmConfig, rootPath: string) =
   log(&"[zpm --root {rootPath}] sync (odświeżenie metadanych repo w obrazie)")
+
 proc runBuildingStage*(cfg: ZpmConfig, rootPath, stage: string) =
   ## `zpm --root=<rootfs> stage <etykieta>` -- instaluje (buduje + instaluje)
   ## WSZYSTKIE narzędzia `own` oznaczone daną etykietą `stage` wprost do
@@ -170,7 +285,7 @@ proc runBuildingStage*(cfg: ZpmConfig, rootPath, stage: string) =
     log("[zpm --building] Wymagana flaga --root=<ścieżka>.")
     quit(1)
   createDir(rootPath)
-  let repo = loadOwnRepository(cfg.customRepoPath)
+  let repo = loadOwnRepositoryAutoRefresh(cfg)
   let destDir = rootPath / "usr" / "local" / "bin"
   if not installStageOwn(repo, cfg, stage, destDir, rootPath):
     quit(1)
