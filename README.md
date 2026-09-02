@@ -96,13 +96,41 @@ jednego z dwóch typów:
   skryptów, wraz z opisem konwencji i przekazywanych zmiennych
   środowiskowych, są w `docs/git-tool-template/`.
 
+Pełny przykładowy plik `own-repository.json` (dokładnie w formacie, jakiego
+używa [`Zenit-Linux/own-repository`](https://github.com/Zenit-Linux/own-repository))
+jest w `docs/own-repository.example.json`. Kilka pól wartych osobnego
+opisu:
+
+* **`description`** — krótki opis narzędzia. Od schema v0.5 to jest
+  nazwa docelowa tego pola (`"info"` jest nadal czytane jako
+  przestarzały alias dla wstecznej zgodności ze starszymi plikami, ale
+  `zpm own list/info --json` zawsze SERIALIZUJE `"description"`).
+* **`tags`** — etykiety narzędzia, albo jako string rozdzielony
+  przecinkami (`"tags": "de, graphical-environment"` — konwencja
+  własnego repozytorium), albo jako tablica stringów
+  (`"tags": ["de", "graphical-environment"]`) — obie formy są
+  równoważne. Filtrowanie: `zpm own list --tag=de`.
+* **`{version}`** — placeholder w polu `bin` (URL musi wskazywać na
+  `github.com`), podmieniany PRZED pobraniem:
+  `zpm own install zenit-base` sam ustala najnowszą wersję przez
+  GitHub Releases API; `zpm own install zenit-base@1.2.0` wymusza
+  dokładnie tę wersję, bez żadnego zapytania sieciowego.
+* **`branches`** — alternatywne "systemy"/warianty tego samego
+  narzędzia (np. `kernel` ma `stable`, gotowy `.zpk` z wydania, i
+  `rolling`, budowany ze źródeł przy każdej instalacji). Zobacz
+  `zpm own systems <nazwa>` i `zpm own install <nazwa> --branch=<system>`.
+
 ```bash
-zpm own list                 # co jest w own-repository.json (typ, źródło, opis, zależności)
-zpm own info kernel          # pełne szczegóły jednego narzędzia
+zpm own list                 # co jest w own-repository.json (typ, źródło, opis, tagi, zależności)
+zpm own list --tag=de        # tylko narzędzia z danym tagiem (np. graficzne środowiska)
+zpm own info kernel          # pełne szczegóły jednego narzędzia (w tym dostępne systemy/branches)
+zpm own systems kernel       # -> stable, rolling
 zpm own build kernel         # (tylko 'git') buduje 'kernel' I jego zależności (patrz niżej), bez
                               # końcowej instalacji samego 'kernel'
 zpm install kernel           # albo: zpm own install kernel — build + install, z zależnościami
-zpm own remove kernel        # usuwa (binary: kasuje plik; git: wymaga uninstall_script)
+zpm own install kernel --branch=stable    # instaluje gotowy .zpk zamiast budować ze źródeł
+zpm own install zenit-base@1.2.0          # wymusza dokładną wersję zamiast auto-detekcji "najnowszej"
+zpm own remove kernel         # usuwa (binary: kasuje plik; git: wymaga uninstall_script)
 
 zpm refresh                  # pobiera świeży own-repository.json z custom.remote_url (a przy
                               # błędzie kolejno z custom.mirrors), WALIDUJE go i dopiero wtedy
@@ -336,8 +364,10 @@ podmana `zpm` tworzy pusty szkielet (tryb offline/prototypowy).
 
 ## Konfiguracja: `/etc/zpm/config.hcl`
 
-Uproszczony format HCL (bloki, `klucz = wartość`, listy `["a","b"]`),
-parsowany bez zewnętrznych zależności (`src/zpmpkg/hcl.nim`):
+Format HCL (bloki, `klucz = wartość`, listy `["a","b"]`), parsowany przez
+bibliotekę [`hcl_nim`](https://github.com/Zenit-Linux/hcl-nim) (`src/zpmpkg/hcl.nim`
+to cienka warstwa kompatybilności nad nią — pełny parser HCL v1/v2, nie
+ręcznie pisany fragment składni):
 
 ```hcl
 core {
@@ -428,7 +458,7 @@ zpm/
     ├── zpm.nim                   # punkt wejścia — routing standard/atomic
     └── zpmpkg/
         ├── types.nim             # wspólne typy (PackageCandidate, ZpmConfig, ...)
-        ├── hcl.nim                # własny, minimalny parser HCL
+        ├── hcl.nim                # warstwa kompatybilności nad hcl_nim (parser HCL v1/v2)
         ├── config.nim             # wczytywanie /etc/zpm/config.hcl
         ├── database.nim           # warstwa SQLite (centralna baza zainstalowanych pakietów)
         ├── orchestrator.nim       # serce Trybu Standardowego (search/install/update/refresh/lock/list)
