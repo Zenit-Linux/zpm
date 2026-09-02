@@ -430,7 +430,7 @@ proc cmdLock*(cfg: ZpmConfig, names: seq[string]) =
       var sha = tool.sha256
       if sha.len == 0 and tool.bin.len > 0:
         let tmpDir = getTempDir() / "zpm-lock-tmp"
-        let (dlOk, path) = downloadOwnTool(tool, tmpDir, cfg)
+        let (dlOk, path, _) = downloadOwnTool(tool, tmpDir, cfg)
         if dlOk:
           sha = sha256sumOf(path)
           removeFile(path)
