@@ -29,6 +29,7 @@ proc saveOwnReceipt*(cfg: ZpmConfig, r: OwnInstallReceipt) =
   j["name"] = %r.name
   j["resolved_ref"] = %r.resolvedRef
   j["sha256"] = %r.sha256
+  j["version"] = %r.version
   j["root_path"] = %r.rootPath
   j["installed_at"] = %r.installedAt
   let path = receiptPath(cfg, r.name, r.rootPath)
@@ -45,6 +46,7 @@ proc loadOwnReceipt*(cfg: ZpmConfig, name, rootPath: string): tuple[found: bool,
       name: j{"name"}.getStr(""),
       resolvedRef: j{"resolved_ref"}.getStr(""),
       sha256: j{"sha256"}.getStr(""),
+      version: j{"version"}.getStr(""),
       rootPath: j{"root_path"}.getStr(""),
       installedAt: j{"installed_at"}.getStr(""),
     ))
@@ -68,6 +70,7 @@ proc allOwnReceipts*(cfg: ZpmConfig): seq[OwnInstallReceipt] =
         name: j{"name"}.getStr(""),
         resolvedRef: j{"resolved_ref"}.getStr(""),
         sha256: j{"sha256"}.getStr(""),
+        version: j{"version"}.getStr(""),
         rootPath: j{"root_path"}.getStr(""),
         installedAt: j{"installed_at"}.getStr(""),
       )
