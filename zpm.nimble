@@ -1,4 +1,4 @@
-version       = "0.2.0"
+version       = "0.3.0"
 author        = "Zenit Linux Developers"
 description   = "Zenit Package Manager (zpm) — inteligentny orkiestrator pakietów dla Zenit Linux"
 license       = "Apache-2.0"
