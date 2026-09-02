@@ -84,6 +84,32 @@ proc jsonStrSeq(node: JsonNode, key: string): seq[string] =
     for it in node[key]:
       if it.kind == JString: result.add it.getStr
 
+proc parseTagsField*(node: JsonNode): seq[string] =
+  ## v0.5 -- pole "tags" w own-repository.json. Wspiera DWIE równoważne
+  ## formy: string rozdzielony przecinkami (dokładnie konwencja z
+  ## own-repository.json, np. `"tags": "graphical-environment, de"`) ALBO
+  ## tablicę stringów (`"tags": ["graphical-environment", "de"]`, dla
+  ## przyszłych/innych generatorów pliku). Puste/brakujące pole -> pusta
+  ## lista. Puste elementy (np. z końcowego przecinka `"gnu-free,"`) są
+  ## pomijane, a każdy tag jest przycinany (`strip`) i sprowadzany do
+  ## małych liter -- filtrowanie po tagu (`--tag=`) ma być bezstresowe
+  ## co do wielkości liter/białych znaków w źródle.
+  result = @[]
+  if not node.hasKey("tags"): return
+  let t = node["tags"]
+  case t.kind
+  of JString:
+    for part in t.getStr("").split(','):
+      let p = part.strip().toLowerAscii()
+      if p.len > 0: result.add p
+  of JArray:
+    for it in t:
+      if it.kind == JString:
+        let p = it.getStr("").strip().toLowerAscii()
+        if p.len > 0: result.add p
+  else:
+    discard
+
 proc looksLikeGitUrl(s: string): bool =
   s.endsWith(".git") or s.startsWith("git@") or s.startsWith("git://") or s.startsWith("ssh://git@")
 
@@ -145,6 +171,14 @@ proc parseOwnTool*(item: JsonNode): OwnRepoTool =
 
   let lang = item{"lang"}.getStr("janet")
 
+  ## v0.5 -- "description" ZASTĘPUJE "info" jako nazwa pola opisu w
+  ## own-repository.json ("musisz zmienic opis od dzis to nie info tylko
+  ## description"); "info" jest nadal czytane jako przestarzały (deprecated)
+  ## alias, żeby starsze pliki own-repository.json (jeszcze niezaktualizowane)
+  ## nie przestały nagle działać.
+  let description = item{"description"}.getStr(item{"info"}.getStr(""))
+  let tags = parseTagsField(item)
+
   if isGit:
     let repoUrl = if repoRaw.len > 0: repoRaw else: binResolved
     if repoUrl.len == 0:
@@ -154,7 +188,8 @@ proc parseOwnTool*(item: JsonNode): OwnRepoTool =
       kind: otkGit,
       bin: "",
       sha256: item{"sha256"}.getStr(""),
-      info: item{"info"}.getStr(""),
+      description: description,
+      tags: tags,
       repo: repoUrl,
       gitRef: item{"ref"}.getStr(item{"branch"}.getStr("main")),
       lang: lang,
@@ -178,7 +213,8 @@ proc parseOwnTool*(item: JsonNode): OwnRepoTool =
       bin: binResolved,
       binByArch: binByArch,
       sha256: item{"sha256"}.getStr(""),
-      info: item{"info"}.getStr(""),
+      description: description,
+      tags: tags,
       dependsOn: jsonStrSeq(item, "depends_on"),
       stage: item{"stage"}.getStr(""),
     )
@@ -313,15 +349,34 @@ proc resolveOwnToolBranch*(tool: OwnRepoTool, branch: string): tuple[ok: bool, r
     return (false, tool, &"branch '{branch}' narzędzia '{tool.name}' nie przeszedł walidacji: {e.msg}")
 
 proc searchOwn*(repo: OwnRepository, query: string): seq[PackageCandidate] =
+  ## v0.5 -- dopasowanie po nazwie, opisie (`description`, dawniej tylko
+  ## `info`) LUB po dokładnym tagu (`tags`) -- `zpm install graphical-
+  ## environment` znajdzie teraz np. `zde`/`blue-environment`, nie tylko
+  ## narzędzia, które akurat mają to słowo w nazwie/opisie.
   result = @[]
   let q = query.toLowerAscii
   for t in repo.tools:
-    if t.name.toLowerAscii.contains(q) or (t.info.len > 0 and t.info.toLowerAscii.contains(q)):
+    let matchesTag = q in t.tags
+    if t.name.toLowerAscii.contains(q) or
+       (t.description.len > 0 and t.description.toLowerAscii.contains(q)) or
+       matchesTag:
       let src = if t.kind == otkGit: &"repo git ({t.repo}, ref={t.gitRef}, {t.lang})" else: t.bin
+      let tagsStr = if t.tags.len > 0: &" [tagi: {t.tags.join(\", \")}]" else: ""
       result.add PackageCandidate(
-        name: t.name, version: "", description: "narzędzie z ekosystemu Zenit (own): " & src,
+        name: t.name, version: "", description: "narzędzie z ekosystemu Zenit (own): " & src & tagsStr,
         backend: bkOwn, installCmd: @[], extra: src
       )
+
+proc toolsByTag*(repo: OwnRepository, tag: string): seq[OwnRepoTool] =
+  ## v0.5 -- `zpm own list --tag=<tag>` / filtrowanie w skryptach zewnętrznych
+  ## (np. `zlb` budujące obraz tylko z jedną grupą narzędzi, np. wszystkimi
+  ## "de"/graficznymi środowiskami). Dopasowanie dokładne, bez uwzględniania
+  ## wielkości liter (tagi są normalizowane do małych liter przy parsowaniu
+  ## -- patrz `parseTagsField`).
+  let t = tag.strip().toLowerAscii()
+  result = @[]
+  for tool in repo.tools:
+    if t in tool.tags: result.add tool
 
 # ---------------------------------------------------------------------------
 # `zpm refresh` / `zpm own refresh` -- pobranie świeżego own-repository.json
@@ -445,7 +500,82 @@ proc resolveOwnBinUrl*(tool: OwnRepoTool, cfg: ZpmConfig): string =
   log(&"[zpm:own] ⚠ '{tool.name}': brak wariantu 'bin' dla architektury '{want}' -- używam {tool.bin}")
   tool.bin
 
-proc downloadOwnTool*(tool: OwnRepoTool, destDir: string, cfg: ZpmConfig): tuple[ok: bool, path: string] =
+proc containsVersionPlaceholder*(url: string): bool =
+  ## v0.5 -- czy `url` (pole "bin") zawiera placeholder `{version}`,
+  ## patrz komentarz w types.nim (`OwnRepoTool`) i `resolveVersionPlaceholder`
+  ## niżej.
+  "{version}" in url
+
+proc parseGithubOwnerRepo*(url: string): tuple[ok: bool, owner, repo: string] =
+  ## Wyciąga "owner/repo" z URL-a GitHuba -- działa zarówno dla
+  ## `https://github.com/OWNER/REPO/releases/download/{version}/plik.zpk`
+  ## jak i `https://github.com/OWNER/REPO.git` -- automatyczne wykrycie
+  ## "najnowszej wersji" potrzebuje tylko właściciela/nazwy repo, nie
+  ## reszty ścieżki.
+  const marker = "github.com/"
+  let idx = url.find(marker)
+  if idx < 0:
+    return (false, "", "")
+  var rest = url[idx + marker.len .. ^1]
+  let qIdx = rest.find('?')
+  if qIdx >= 0: rest = rest[0 ..< qIdx]
+  let parts = rest.split('/')
+  if parts.len < 2 or parts[0].len == 0 or parts[1].len == 0:
+    return (false, "", "")
+  var repo = parts[1]
+  if repo.endsWith(".git"): repo = repo[0 ..< repo.len - 4]
+  (true, parts[0], repo)
+
+proc fetchLatestGithubRelease*(owner, repo: string, cfg: ZpmConfig): tuple[ok: bool, tag, err: string] =
+  ## Ustala NAJNOWSZĄ wersję (tag) danego repo GitHuba przez oficjalne REST
+  ## API (`GET /repos/{owner}/{repo}/releases/latest`) -- dokładnie to, co
+  ## GitHub uznaje za "Latest release" na stronie repo (najnowszy NIE-
+  ## -prerelease/NIE-draft release). Idzie przez `netutil.safeFetchUrlBody`,
+  ## więc honoruje `security.trusted_hosts`/`max_download_mb`/pinning
+  ## certyfikatu tak samo jak każde inne pobranie zpm.
+  let apiUrl = &"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+  let r = safeFetchUrlBody(apiUrl, cfg, "zpm:own:version")
+  if not r.ok:
+    return (false, "", &"nie udało się odpytać GitHub API ({apiUrl}): {r.err}")
+  try:
+    let j = parseJson(r.body)
+    let tag = j{"tag_name"}.getStr("")
+    if tag.len == 0:
+      return (false, "", &"odpowiedź GitHub API dla {owner}/{repo} nie zawiera 'tag_name' " &
+        "(repo bez żadnego opublikowanego wydania?)")
+    (true, tag, "")
+  except CatchableError as e:
+    (false, "", &"nie udało się sparsować odpowiedzi GitHub API dla {owner}/{repo}: {e.msg}")
+
+proc resolveVersionPlaceholder*(url: string, cfg: ZpmConfig,
+                                 requestedVersion: string = ""): tuple[ok: bool, url, version, err: string] =
+  ## v0.5 -- podmienia placeholder `{version}` w `url` (patrz komentarz w
+  ## types.nim, `OwnRepoTool`):
+  ##  - `url` BEZ `{version}` -> zwracany bez zmian, `version` puste (nic
+  ##    do rozwiązania -- pełna kompatybilność wsteczna ze zwykłymi URL-ami).
+  ##  - `requestedVersion` niepuste (`zpm own install <nazwa>@<wersja>`)
+  ##    -> podmienione WPROST, zero zapytań sieciowych.
+  ##  - inaczej -> zpm SAM ustala najnowszą wersję przez GitHub Releases
+  ##    API (wymaga, żeby `url` wskazywał na github.com -- inny host to
+  ##    twardy błąd z czytelną podpowiedzią, nie cichy brak podmiany).
+  if not containsVersionPlaceholder(url):
+    return (true, url, "", "")
+  if requestedVersion.len > 0:
+    return (true, url.replace("{version}", requestedVersion), requestedVersion, "")
+  let (ghOk, owner, repo) = parseGithubOwnerRepo(url)
+  if not ghOk:
+    return (false, url, "", &"'{url}' zawiera placeholder '{{version}}', ale nie jest to URL " &
+      "github.com -- automatyczne wykrycie najnowszej wersji jest wspierane tylko dla GitHuba " &
+      "(podaj wersję wprost: `zpm own install <nazwa>@<wersja>`)")
+  log(&"[zpm:own] Ustalam najnowszą wersję '{owner}/{repo}' (GitHub Releases API) ...")
+  let (relOk, tag, relErr) = fetchLatestGithubRelease(owner, repo, cfg)
+  if not relOk:
+    return (false, url, "", relErr)
+  log(&"[zpm:own] ✔ Najnowsza wersja '{owner}/{repo}': {tag}")
+  (true, url.replace("{version}", tag), tag, "")
+
+proc downloadOwnTool*(tool: OwnRepoTool, destDir: string, cfg: ZpmConfig,
+                       requestedVersion: string = ""): tuple[ok: bool, path: string, version: string] =
   ## Pobiera binarkę narzędzia z jego dosłownego URL-a przez netutil.nim
   ## (v0.2: honoruje `security.trusted_hosts`/`max_download_mb`, loguje
   ## postęp pobierania co ~10% pod --verbose -- zamiast w pełni cichego
@@ -453,16 +583,32 @@ proc downloadOwnTool*(tool: OwnRepoTool, destDir: string, cfg: ZpmConfig): tuple
   ## zapisuje do destDir/<name>, ustawia +x i (jeśli podano) weryfikuje sha256.
   ## v0.4: jeśli narzędzie ma kilka wariantów architektur (`binByArch`),
   ## wybiera ten pasujący do `cfg.targetArch`/hosta -- patrz `resolveOwnBinUrl`.
-  let binUrl = resolveOwnBinUrl(tool, cfg)
+  ## v0.5: jeśli wybrany URL zawiera `{version}`, rozwiązuje go PRZED
+  ## pobraniem -- wprost na `requestedVersion` (jeśli podano, np.
+  ## `zpm own install kernel@2024.10`), inaczej automatycznie na
+  ## najnowsze wydanie GitHuba (patrz `resolveVersionPlaceholder`).
+  ## Zwrócone `version` (może być puste, jeśli `bin` nie miał placeholdera)
+  ## trafia do pokwitowania instalacji (`OwnInstallReceipt.version`).
+  var binUrl = resolveOwnBinUrl(tool, cfg)
   if binUrl.len == 0:
-    return (false, "")
+    return (false, "", "")
+
+  var resolvedVersion = ""
+  if containsVersionPlaceholder(binUrl):
+    let (verOk, resolvedUrl, ver, verErr) = resolveVersionPlaceholder(binUrl, cfg, requestedVersion)
+    if not verOk:
+      stderr.writeLine(&"[zpm:own] ✘ '{tool.name}': {verErr}")
+      return (false, "", "")
+    binUrl = resolvedUrl
+    resolvedVersion = ver
+
   createDir(destDir)
   let dest = destDir / tool.name
   log(&"[zpm:own] Pobieram '{tool.name}' z {binUrl} ...")
   let (dlOk, dlErr) = safeDownloadFile(binUrl, dest, cfg, "zpm:own")
   if not dlOk:
     stderr.writeLine(&"[zpm:own] ✘ Pobieranie '{tool.name}' nie powiodło się: {dlErr}")
-    return (false, "")
+    return (false, "", "")
 
   when defined(posix):
     discard execShellCmd(&"chmod +x \"{dest}\"")
@@ -473,10 +619,11 @@ proc downloadOwnTool*(tool: OwnRepoTool, destDir: string, cfg: ZpmConfig): tuple
       stderr.writeLine(&"[zpm:own] ✘ Suma sha256 narzędzia '{tool.name}' nie zgadza się " &
         &"(oczekiwano {tool.sha256}, otrzymano {got}) -- usuwam plik.")
       removeFile(dest)
-      return (false, "")
+      return (false, "", "")
 
-  log(&"[zpm:own] ✔ '{tool.name}' zainstalowane w {dest}")
-  (true, dest)
+  log(&"[zpm:own] ✔ '{tool.name}' zainstalowane w {dest}" &
+    (if resolvedVersion.len > 0: &" (wersja {resolvedVersion})" else: ""))
+  (true, dest, resolvedVersion)
 
 # ---------------------------------------------------------------------------
 # Instalacja narzędzi typu `git` (budowanie ze źródeł: build.<lang> + install.<lang>)
@@ -974,7 +1121,8 @@ proc installOwnFromSource*(tool: OwnRepoTool, srcDir: string, rootPath: string, 
 # ---------------------------------------------------------------------------
 
 proc installOwn*(repo: OwnRepository, name: string, cfg: ZpmConfig,
-                  binDestDir: string, rootPath: string = "/", force = false, branch: string = ""): int =
+                  binDestDir: string, rootPath: string = "/", force = false, branch: string = "",
+                  toolVersion: string = ""): int =
   ## `binDestDir` -- gdzie ląduje gotowa binarka dla narzędzi typu `binary`
   ## (np. /usr/local/bin albo <root>/usr/local/bin przy budowaniu obrazu).
   ## `rootPath`   -- korzeń instalacji przekazywany narzędziom typu `git`
@@ -983,7 +1131,13 @@ proc installOwn*(repo: OwnRepository, name: string, cfg: ZpmConfig,
   ## build+install/pobranie, nawet jeśli pokwitowanie mówi, że to już jest.
   ## `branch`     -- v0.3: "" = domyślny wariant z own-repository.json;
   ## niepusty = rozwiąż przez `resolveOwnToolBranch` PRZED czymkolwiek innym
-  ## (np. "testing", "rolling" -- patrz pole "branches" w schema_version 2).
+  ## (np. "testing", "rolling"/"stable" -- patrz pole "branches" w
+  ## schema_version 2 -- w praktyce to właśnie "systemy" jądra, patrz
+  ## `zpm own systems <nazwa>`).
+  ## `toolVersion` -- v0.5: "" = zpm SAM ustala najnowszą wersję (jeśli
+  ## `bin` zawiera `{version}` -- patrz `resolveVersionPlaceholder`);
+  ## niepusty = użyj DOKŁADNIE tej wersji (`zpm own install <nazwa>@<wersja>`).
+  ## Bez znaczenia dla `bin` bez placeholdera (kompatybilność wsteczna).
   ## Pokwitowanie i tak jest zapisywane pod `name` (nie `name@branch`), więc
   ## `zpm own remove kernel` znajduje go niezależnie od tego, jaki branch
   ## posłużył do instalacji -- branch nie jest częścią tożsamości pakietu
@@ -1019,14 +1173,24 @@ proc installOwn*(repo: OwnRepository, name: string, cfg: ZpmConfig,
         if tool.sha256.len > 0 and receipt.sha256 == tool.sha256:
           log(&"[zpm:own] '{tool.name}' już zainstalowane (sha256 zgodne, root={rootPath}) -- pomijam (użyj --force, żeby wymusić).")
           return 0
+        # v0.5 -- dla `bin` z `{version}` zwykle NIE MA sha256 (zmienia się
+        # z każdym wydaniem, patrz komentarz w types.nim), więc powyższy
+        # warunek nigdy się nie uruchomi -- idempotencję daje tu porównanie
+        # DOKŁADNIE zażądanej wersji z tym, co faktycznie jest zainstalowane
+        # (auto-wykryta "najnowsza" wersja ZAWSZE wymusza świeże sprawdzenie,
+        # skoro "najnowsza" mogła się zmienić od poprzedniej instalacji).
+        if toolVersion.len > 0 and receipt.version == toolVersion:
+          log(&"[zpm:own] '{tool.name}' już zainstalowane w wersji {toolVersion} (root={rootPath}) -- pomijam (użyj --force, żeby wymusić).")
+          return 0
 
   case tool.kind
   of otkBinary:
-    let (ok, path) = downloadOwnTool(tool, binDestDir, cfg)
+    let (ok, path, resolvedVersion) = downloadOwnTool(tool, binDestDir, cfg, toolVersion)
     if not ok: return 1
     let sha = if tool.sha256.len > 0: tool.sha256 else: sha256sumOf(path)
     saveOwnReceipt(cfg, OwnInstallReceipt(
-      name: tool.name, resolvedRef: "", sha256: sha, rootPath: rootPath, installedAt: nowIso8601()
+      name: tool.name, resolvedRef: "", sha256: sha, version: resolvedVersion,
+      rootPath: rootPath, installedAt: nowIso8601()
     ))
     0
   of otkGit:
@@ -1094,7 +1258,8 @@ proc removeOwn*(repo: OwnRepository, name: string, cfg: ZpmConfig,
 
 proc installManyOwn*(repo: OwnRepository, cfg: ZpmConfig, targets: seq[string],
                       binDestDir: string, rootPath: string = "/", force = false,
-                      branchFor: Table[string, string] = initTable[string, string]()): bool =
+                      branchFor: Table[string, string] = initTable[string, string](),
+                      versionFor: Table[string, string] = initTable[string, string]()): bool =
   ## Rozwiązuje graf zależności (deps.nim) dla `targets`, po czym instaluje
   ## KOLEJNO -- zależności zawsze przed tym, co ich potrzebuje. Przerywa na
   ## pierwszym niepowodzeniu (nie ma sensu instalować B, jeśli jego
@@ -1109,6 +1274,11 @@ proc installManyOwn*(repo: OwnRepository, cfg: ZpmConfig, targets: seq[string],
   ## używają swojego domyślnego brancha, chyba że same są też w tej mapie.
   ## Innymi słowy: branch to wybór dla KONKRETNEGO żądania instalacji, nie
   ## coś, co "spływa" automatycznie na całe drzewo zależności.
+  ##
+  ## `versionFor` -- v0.5: mapa nazwa->wersja, np. {"zenit-base": "1.2.0"},
+  ## dla `zpm own install zenit-base@1.2.0`. Tak samo jak `branchFor`,
+  ## dotyczy TYLKO jawnie podanych `targets`; ma znaczenie tylko dla
+  ## narzędzi, których `bin` zawiera `{version}` (patrz `installOwn`).
   ##
   ## v0.2 -- zamyka lukę "`flock` chroni przed RÓWNOLEGŁYMI procesami, nie
   ## daje transakcyjności między operacjami": `zpm own install A B`, gdzie
@@ -1149,7 +1319,8 @@ proc installManyOwn*(repo: OwnRepository, cfg: ZpmConfig, targets: seq[string],
   for name in order:
     let alreadyInstalled = not force and isOwnInstalled(cfg, name, rootPath)
     let branch = branchFor.getOrDefault(name, "")
-    if installOwn(repo, name, cfg, binDestDir, rootPath, force, branch) != 0:
+    let version = versionFor.getOrDefault(name, "")
+    if installOwn(repo, name, cfg, binDestDir, rootPath, force, branch, version) != 0:
       stderr.writeLine(&"[zpm:own] ✘ Przerywam -- '{name}' nie zainstalowało się poprawnie.")
       rollbackFreshlyInstalled()
       return false
@@ -1222,7 +1393,7 @@ proc buildManyOwn*(repo: OwnRepository, cfg: ZpmConfig, targets: seq[string],
         let (ok, _) = buildOwnFromSource(tool, cfg, rootPath)
         if not ok: return false
       of otkBinary:
-        let (ok, _) = downloadOwnTool(tool, cfg.ownToolsInstallDir, cfg)
+        let (ok, _, _) = downloadOwnTool(tool, cfg.ownToolsInstallDir, cfg)
         if not ok: return false
   true
 
@@ -1322,7 +1493,11 @@ proc ownToolToJson(t: OwnRepoTool): JsonNode =
   result = newJObject()
   result["name"] = %t.name
   result["type"] = %($t.kind)
-  result["info"] = %t.info
+  ## v0.5 -- serializujemy TERAZ WYŁĄCZNIE "description" (nigdy "info"),
+  ## niezależnie od tego, czy oryginalny wpis w own-repository.json użył
+  ## "description" czy przestarzałego "info" -- patrz `parseOwnTool`.
+  result["description"] = %t.description
+  result["tags"] = %t.tags
   result["depends_on"] = %t.dependsOn
   result["stage"] = %t.stage
   case t.kind
@@ -1384,8 +1559,26 @@ proc listOwn*(repo: OwnRepository) =
     if t.dependsOn.len > 0:
       let depsStr = t.dependsOn.join(", ")
       log(&"        zależy od: {depsStr}")
-    if t.info.len > 0:
-      log(&"        {t.info}")
+    if t.tags.len > 0:
+      log(&"        tagi: {t.tags.join(\", \")}")
+    if t.description.len > 0:
+      log(&"        {t.description}")
+
+proc listOwnByTag*(repo: OwnRepository, tag: string) =
+  ## v0.5 -- `zpm own list --tag=<tag>`, patrz `toolsByTag`.
+  let matches = toolsByTag(repo, tag)
+  if matches.len == 0:
+    log(&"[zpm:own] Brak narzędzi z tagiem '{tag}'.")
+    return
+  log(&"[zpm:own] Narzędzia z tagiem '{tag}' ({matches.len}):")
+  var tools = matches
+  tools.sort(proc(a, b: OwnRepoTool): int = cmp(a.name, b.name))
+  for t in tools:
+    case t.kind
+    of otkBinary: log(&"  - {t.name}  [binary]  <-  {t.bin}")
+    of otkGit:     log(&"  - {t.name}  [git]     <-  {t.repo} (ref={t.gitRef})")
+    if t.description.len > 0: log(&"        {t.description}")
+
 proc infoOwn*(repo: OwnRepository, name: string) =
   let t = repo.findTool(name)
   if t.name.len == 0:
@@ -1393,7 +1586,11 @@ proc infoOwn*(repo: OwnRepository, name: string) =
     return
   log(&"[zpm:own] {t.name}")
   log(&"  typ:    {t.kind}")
-  if t.info.len > 0: log(&"  opis:   {t.info}")
+  if t.description.len > 0: log(&"  opis:   {t.description}")
+  if t.tags.len > 0: log(&"  tagi:   {t.tags.join(\", \")}")
+  let systemsAvail = availableBranches(t)
+  if systemsAvail.len > 0:
+    log(&"  systemy (branches): {systemsAvail.join(\", \")}")
   if t.dependsOn.len > 0:
     let depsStr = t.dependsOn.join(", ")
     log(&"  zależy: {depsStr}")
