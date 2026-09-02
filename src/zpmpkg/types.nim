@@ -42,11 +42,17 @@ type
 
   ## ---- własny ekosystem Zenit (custom/own-repository.json) --------------
   ##
-  ## Format pliku (pełna, rozbudowana wersja):
+  ## Format pliku (pełna, rozbudowana wersja, schema_version 2 -- v0.5):
   ## {
-  ##   "schema_version": 1,
+  ##   "schema_version": 2,
   ##   "tools": [
   ##     { "name": "cr", "type": "binary", "bin": "https://.../cr", "sha256": "..." },
+  ##     {
+  ##       "name": "zenit-base",
+  ##       "bin": "https://github.com/Zenith-Linux/zenit-base/releases/download/{version}/zenit-base.zpk",
+  ##       "description": "Alternative tools for gnu.",
+  ##       "tags": "gnu-free"
+  ##     },
   ##     {
   ##       "name": "kernel",
   ##       "type": "git",
@@ -55,7 +61,12 @@ type
   ##       "lang": "janet",
   ##       "build_script": "build.janet",
   ##       "install_script": "install.janet",
-  ##       "info": "kernel, build from source"
+  ##       "description": "Linux kernel for Zenit Linux (default).",
+  ##       "tags": "kernel",
+  ##       "branches": {
+  ##         "stable":  { "type": "binary", "bin": "https://github.com/Zenit-Linux/kernel/releases/download/{version}/kernel.zpk" },
+  ##         "rolling": { "type": "git", "repo": "https://github.com/Zenit-Linux/kernel.git", "ref": "main" }
+  ##       }
   ##     }
   ##   ]
   ## }
@@ -66,7 +77,8 @@ type
   ##
   ##  - `binary` -- dosłownie zlinkowana, gotowa binarka (`bin`), pobierana
   ##    wprost przez std/httpclient i (opcjonalnie) weryfikowana sumą
-  ##    sha256. To oficjalna alternatywa dla `curl ... | sh`.
+  ##    sha256. To oficjalna alternatywa dla `curl ... | sh`. `bin` MOŻE
+  ##    zawierać placeholder `{version}` (v0.5) -- patrz niżej.
   ##
   ##  - `git` -- repozytorium źródłowe (`repo`, dawniej też dozwolone jako
   ##    `bin` kończące się na ".git" -- wykrywane automatycznie dla
@@ -79,6 +91,29 @@ type
   ##    Domyślny język to Janet (`janet build.janet`, `janet install.janet`),
   ##    ale `lang` pozwala wskazać inny interpreter/runtime (patrz
   ##    `langInterpreter` w ownrepo.nim).
+  ##
+  ## v0.5 -- zmiany w polach opisowych:
+  ##  - `description` ZASTĘPUJE `info` jako nazwa pola z krótkim opisem
+  ##    narzędzia (od tej wersji: NOWE wpisy own-repository.json powinny
+  ##    używać `description`; `info` jest nadal czytane jako przestarzały
+  ##    (deprecated) alias dla wstecznej zgodności ze starszymi plikami --
+  ##    patrz `parseOwnTool` w ownrepo.nim). Serializacja (`own list/info
+  ##    --json`) od teraz ZAWSZE zapisuje `description`, nigdy `info`.
+  ##  - `tags` -- opcjonalna lista etykiet narzędzia, np. do filtrowania
+  ##    (`zpm own list --tag=de`) albo wyszukiwania. W JSON-ie może być
+  ##    ALBO stringiem rozdzielonym przecinkami (`"tags": "de, graphical-
+  ##    environment"` -- dokładnie konwencja z own-repository.json), ALBO
+  ##    tablicą stringów (`"tags": ["de", "graphical-environment"]`) --
+  ##    obie formy są równoważne, patrz `parseTagsField` w ownrepo.nim.
+  ##  - `{version}` -- placeholder w polu `bin` (string ALBO w każdej
+  ##    wartości obiektu {arch: url}), podmieniany przez zpm PRZED
+  ##    pobraniem: jeśli operator poda konkretną wersję (`zpm own install
+  ##    <nazwa>@<wersja>`), używana jest ta wartość wprost; w przeciwnym
+  ##    razie zpm samo ustala NAJNOWSZĄ wersję przez GitHub Releases API
+  ##    (`GET /repos/{owner}/{repo}/releases/latest`, wyprowadzone z hosta/
+  ##    ścieżki samego URL-a `bin` -- patrz `resolveVersionPlaceholder` w
+  ##    ownrepo.nim). Wymaga, żeby `bin` wskazywał na GitHub (releases
+  ##    innych hostów nie są [jeszcze] wspierane).
   OwnToolKind* = enum
     otkBinary = "binary"   ## pojedyncza, gotowa binarka pod dosłownym URL-em
     otkGit    = "git"      ## repozytorium git budowane ze źródeł (build.janet + install.janet)
@@ -103,8 +138,15 @@ type
     sha256*: string             ## opcjonalny checksum do weryfikacji (może być puste) -- dla
                                   ## wariantu wybranego jako `bin` (per-arch sha256 nie jest jeszcze
                                   ## publikowane osobno przez `zpk`, więc jeden wspólny checksum,
-                                  ## jeśli w ogóle podany, dotyczy tylko wariantu jednoarchitekturowego)
-    info*: string                ## opcjonalny, krótki opis narzędzia
+                                  ## jeśli w ogóle podany, dotyczy tylko wariantu jednoarchitekturowego;
+                                  ## dla `bin` z placeholderem `{version}` zwykle i tak PUSTY, bo suma
+                                  ## zmienia się z każdym wydaniem -- patrz `{version}` wyżej)
+    description*: string         ## v0.5 -- krótki opis narzędzia; pole JSON to `description`
+                                  ## (dawniej `info` -- wciąż czytane jako przestarzały alias,
+                                  ## patrz `parseOwnTool` w ownrepo.nim)
+    tags*: seq[string]           ## v0.5 -- etykiety narzędzia (pole JSON `tags`, string
+                                  ## rozdzielony przecinkami ALBO tablica stringów w JSON-ie --
+                                  ## patrz `parseTagsField` w ownrepo.nim)
     repo*: string                ## URL repozytorium git (tylko dla otkGit)
     gitRef*: string              ## branch/tag/commit do checkoutowania (domyślnie "main")
     lang*: string                 ## język/runtime skryptów budujących, domyślnie "janet"
@@ -209,6 +251,10 @@ type
     name*: string
     resolvedRef*: string     ## commit/ref, na którym się zainstalowało (kind=git) albo "" (kind=binary)
     sha256*: string            ## suma binarki zainstalowanej (kind=binary)
+    version*: string            ## v0.5 -- wersja podmieniona za `{version}` w `bin` (jeśli `bin` w
+                                  ## ogóle go zawierał; inaczej ""). Pozwala idempotencji rozróżnić
+                                  ## "to samo narzędzie, ta sama wersja" (pomiń) od "nowa wersja
+                                  ## zażądana" (przeinstaluj) -- patrz `installOwn` w ownrepo.nim.
     rootPath*: string
     installedAt*: string
 
