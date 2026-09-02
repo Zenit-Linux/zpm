@@ -1,4 +1,4 @@
-import std/[os, parseopt, strutils, strformat]
+import std/[os, parseopt, strutils, strformat, tables]
 import ./zpmpkg/types
 import ./zpmpkg/config
 import ./zpmpkg/database
@@ -13,6 +13,18 @@ else:
   import ./zpmpkg/zpk
 
 const ZpmVersion = "0.3.0"
+
+proc splitOwnNameVersion(spec: string): tuple[name, version: string] =
+  ## v0.5 -- `zpm own install <nazwa>[@<wersja>]`: "@" oddziela DOKŁADNĄ
+  ## żądaną wersję (podmienianą wprost za `{version}` w polu "bin") od
+  ## nazwy narzędzia. Bez "@" (albo z pustą wersją po "@") -- zpm SAM
+  ## ustala najnowszą wersję (patrz `resolveVersionPlaceholder` w
+  ## ownrepo.nim). Bezpieczne wobec "@" nigdzie indziej w `zpm own` nie
+  ## niosącego innego znaczenia (w przeciwieństwie do `zpm install
+  ## pakiet@backend` -- to inna, osobna komenda).
+  let idx = spec.find('@')
+  if idx < 0: return (spec, "")
+  (spec[0 ..< idx], spec[idx+1 .. ^1])
 
 proc printBanner() =
   when defined(atomic):
@@ -49,14 +61,22 @@ proc printHelp() =
     echo "                                   cargo/npm/pip), wymogi bezpieczeństwa (bwrap/gpg/git w PATH)."
     echo "                                   --fix naprawia automatycznie to, co bezpieczne (osierocone"
     echo "                                   pokwitowania/wpisy locka) -- NIE instaluje/usuwa pakietów."
-    echo "  zpm own list [--json]            Listuje narzędzia z custom/own-repository.json"
-    echo "  zpm own info    <nazwa> [--json] Szczegóły narzędzia (typ, repo/bin, skrypty, zależności)"
+    echo "  zpm own list [--json] [--tag=T]  Listuje narzędzia z custom/own-repository.json"
+    echo "                                   (--tag filtruje po tagu, np. --tag=de)"
+    echo "  zpm own info    <nazwa> [--json] Szczegóły narzędzia (typ, repo/bin, skrypty, zależności,"
+    echo "                                   tagi, dostępne systemy/branches)"
+    echo "  zpm own systems <nazwa>          Listuje dostępne systemy (branches) narzędzia, np."
+    echo "                                   `zpm own systems kernel` -> stable, rolling"
     echo "  zpm own refresh                  Alias `zpm refresh`"
     echo "  zpm own build   <nazwa>          (tylko typ 'git') buduje ze źródeł (z zależnościami)"
     echo "                                   bez instalacji"
-    echo "  zpm own install <nazwa...> [--force]"
+    echo "  zpm own install <nazwa[@wersja]...> [--force] [--branch=system]"
     echo "                                   Instaluje narzędzie(a) own (binary lub git, z zależnościami;"
-    echo "                                   idempotentnie -- pomija już zainstalowane, chyba że --force)"
+    echo "                                   idempotentnie -- pomija już zainstalowane, chyba że --force)."
+    echo "                                   @wersja podmienia placeholder {version} w polu \"bin\" wprost"
+    echo "                                   (bez @wersja zpm sam ustala najnowszą przez GitHub Releases)."
+    echo "                                   --branch wybiera system/wariant, np. `kernel --branch=stable`"
+    echo "                                   albo `kernel --branch=rolling` (patrz `zpm own systems`)."
     echo "  zpm own remove  <nazwa...> [--force]"
     echo "                                   Usuwa narzędzie own (blokuje, gdy inne go potrzebują, chyba"
     echo "                                   że --force)"
@@ -95,6 +115,9 @@ proc printHelp() =
     echo "      --target-arch=A  architektura DOCELOWA (cross-compilation), np. aarch64"
     echo "                       przekazywana skryptom jako ZPM_TARGET_ARCH (patrz README)"
     echo "      --pubkey=P       (z `verify`) klucz publiczny PEM do weryfikacji podpisu pakietu .zpk"
+    echo "      --tag=T          (z `own list`) filtruje narzędzia po tagu (np. --tag=graphical-environment)"
+    echo "      --branch=SYSTEM  (z `own install`, alias --system) wybiera system/wariant narzędzia"
+    echo "                       (np. `zpm own install kernel --branch=stable`; patrz `own systems`)"
     echo "      --json           strukturalne wyjście JSON (own list/info, list) zamiast tekstu"
     echo "      --verbose        więcej szczegółów diagnostycznych"
     echo "  -q, --quiet          tylko błędy/wynik końcowy"
@@ -171,6 +194,8 @@ else:
     var doctorFix = false
     var listAll = false
     var pubKeyOpt = ""
+    var tagFilter = ""
+    var branchOpt = ""
     var positional: seq[string] = @[]
 
     var p = initOptParser(commandLineParams())
@@ -198,6 +223,8 @@ else:
         of "fix": doctorFix = true
         of "all", "a": listAll = true
         of "pubkey": pubKeyOpt = val
+        of "tag": tagFilter = val.strip().toLowerAscii()
+        of "branch", "system": branchOpt = val.strip()
         else: discard
       of cmdEnd: discard
 
@@ -285,7 +312,9 @@ else:
       case sub
       of "list":
         let repo = loadOwnRepository(cfg.customRepoPath)
-        if cfg.jsonOutput: echo listOwnJson(repo)
+        if tagFilter.len > 0:
+          listOwnByTag(repo, tagFilter)
+        elif cfg.jsonOutput: echo listOwnJson(repo)
         else: listOwn(repo)
       of "refresh":
         cmdRefresh(cfg)
@@ -309,11 +338,38 @@ else:
         if not ok: quit(1)
       of "install":
         if positional.len < 3:
-          echo "[zpm own] Użycie: zpm own install <nazwa...> [--force]  (zależności instalowane automatycznie)"
+          echo "[zpm own] Użycie: zpm own install <nazwa[@wersja]...> [--force]  " &
+               "(zależności instalowane automatycznie; bez @wersja zpm sam ustala najnowszą, " &
+               "tam gdzie 'bin' tego wymaga -- patrz `zpm own systems`)"
           quit(1)
         let repo = loadOwnRepository(cfg.customRepoPath)
-        if not installManyOwn(repo, cfg, positional[2..^1], cfg.ownToolsInstallDir, "/", force):
+        var names: seq[string] = @[]
+        var versionFor = initTable[string, string]()
+        var branchFor = initTable[string, string]()
+        for spec in positional[2..^1]:
+          let (n, ver) = splitOwnNameVersion(spec)
+          names.add n
+          if ver.len > 0: versionFor[n] = ver
+          if branchOpt.len > 0: branchFor[n] = branchOpt
+        if not installManyOwn(repo, cfg, names, cfg.ownToolsInstallDir, "/", force,
+                               branchFor, versionFor):
           quit(1)
+      of "systems", "branches":
+        if positional.len < 3:
+          echo "[zpm own] Użycie: zpm own systems <nazwa>  (np. `zpm own systems kernel` -> stable, rolling)"
+          quit(1)
+        let repo = loadOwnRepository(cfg.customRepoPath)
+        let tool = repo.findTool(positional[2])
+        if tool.name.len == 0:
+          echo &"[zpm own] Narzędzie '{positional[2]}' nie występuje w own-repository.json."
+          quit(1)
+        let systemsAvail = availableBranches(tool)
+        if systemsAvail.len == 0:
+          echo &"[zpm own] '{tool.name}' nie definiuje żadnych alternatywnych systemów (branches) -- " &
+               "jest tylko jeden, domyślny wariant."
+        else:
+          echo &"[zpm own] Dostępne systemy dla '{tool.name}': {systemsAvail.join(\", \")}"
+          echo &"[zpm own] Użycie: zpm own install {tool.name} --branch=<system>"
       of "remove", "uninstall":
         if positional.len < 3:
           echo "[zpm own] Użycie: zpm own remove <nazwa...> [--force]"
