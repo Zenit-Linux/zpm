@@ -1,7 +1,4 @@
-.\" v0.2 -- zamyka lukę "Strony podręcznika i shell completion -- nie istnieją".
-.\" Format: groff/man(7). Instalacja: kopiuj do /usr/local/share/man/man1/zpm.1
-.\" i uruchom `mandb` (albo dołącz do pakietu .zpk/apt jako część data plików).
-.TH ZPM 1 "2026" "zpm 0.2.0" "Zenit Package Manager"
+.TH ZPM 1 "2026" "zpm 0.3.2" "Zenit Package Manager"
 .SH NAZWA
 zpm \- Zenit Package Manager: orkiestrator pakietów Zenit Linux (apt/dnf/pacman/zypper/brew/flatpak/snap/cargo/npm/pip + ekosystem "own" + repo natywne)
 .SH SKŁADNIA
@@ -12,14 +9,18 @@ zpm \- Zenit Package Manager: orkiestrator pakietów Zenit Linux (apt/dnf/pacman
 to jeden punkt wejścia do zarządzania pakietami na Zenit Linux: przeszukuje
 i instaluje z wielu backendów systemowych naraz, zarządza własnym
 ekosystemem narzędzi budowanych ze źródeł lub pobieranych binarnie
-("own"), oraz natywnym formatem pakietów .zpk. Ma dwa tryby budowania:
+("own"), oraz natywnym formatem pakietów .zpk (manifest, v0.4, mieszka
+WEWNĄTRZ archiwum, nie obok niego -- patrz \fBzpm verify\fR). Ma dwa tryby
+budowania:
 .TP
 \fBTryb STANDARDOWY\fR (domyślny)
 Orkiestrator hosta -- instaluje na bieżący, żywy system.
 .TP
 \fBTryb ATOMOWY\fR (\fB-d:atomic\fR w czasie kompilacji)
 Strażnik kontenerów/obrazów -- izolowane środowiska budowania
-(\fBzpm atomic create/install/enter/list/destroy\fR).
+(\fBzpm atomic create/install/enter/list/destroy/selftest\fR). Trzy
+silniki: \fBpodman\fR/\fBbuildah\fR (obraz z rejestru) albo \fBchroot\fR/
+\fBnspawn\fR (v0.3.2, lokalne archiwum rootfs, bez demona kontenerowego).
 .SH KOMENDY (TRYB STANDARDOWY)
 .TP
 .B zpm install \fIpakiet...\fR [\-y]
@@ -38,6 +39,17 @@ indeks nie jest ponownie pobierany).
 .B zpm refresh
 Odświeża TYLKO custom/own-repository.json.
 .TP
+.B zpm lock \fR[\fInazwa...\fR]
+(Ponownie) pinuje zpm.lock: dokładne commity/sha256. Bez argumentów --
+wszystkie śledzone narzędzia typu \fBgit\fR.
+.TP
+.B zpm verify \fIplik.zpk\fR [\fB\-\-pubkey=\fIklucz\fR]
+Weryfikuje podpis i sumę kontrolną pakietu natywnego \fB.zpk\fR --
+manifest i podpis mieszkają WEWNĄTRZ archiwum (v0.4), więc weryfikacja
+nie wymaga osobnych plików \fI.sig\fR/\fI.sha256\fR obok. Bez
+\fB\-\-pubkey\fR używa kluczy zaufanych systemowo/przez \fBzpm init
+\-\-trust\-keys\fR.
+.TP
 .B zpm list \fR[\fB\-\-json\fR] [\fB\-\-all\fR]
 Listuje pakiety zainstalowane przez zpm (w tym ze statusem "failed").
 \fB\-\-all\fR (v0.2.1) pokazuje widok ujednolicony: baza SQLite ORAZ
@@ -48,22 +60,48 @@ obecnych w jednym, a brakujących w drugim (rozjazd).
 Diagnostyka: porównuje bazę/pokwitowania zpm ze stanem faktycznym na
 dysku (v0.2: odpytuje też apt/dnf/pacman/zypper/flatpak/snap/brew/
 cargo/npm/pip, nie tylko ekosystem "own"), sprawdza wymogi
-bezpieczeństwa (bwrap/gpg/git w PATH, limity zasobów). \fB\-\-fix\fR
-naprawia automatycznie to, co bezpieczne (osierocone pokwitowania,
-wpisy zpm.lock) -- NIE instaluje ani nie usuwa pakietów samodzielnie.
+bezpieczeństwa (bwrap/gpg/git w PATH, limity zasobów) i wersję schematu
+bazy SQLite (v0.3.2, migracje stosowane automatycznie przy otwarciu).
+.br
+\fB\-\-fix\fR naprawia automatycznie: osierocone pokwitowania i wpisy
+zpm.lock (v0.2), ORAZ (v0.3.2) wpisy bazy PODWÓJNIE osierocone --
+pakiet typu \fBown\fR (albo jego wpis \fBfailed\fR) bez pokwitowania NA
+DYSKU \fIi\fR bez wpisu w \fBown-repository.json\fR jednocześnie, gdzie
+nie ma już żadnego źródła prawdy, do którego dałoby się coś
+"przywrócić". Nigdy nie instaluje ani nie usuwa PLIKÓW pakietów
+samodzielnie -- tylko księgowość zpm; przypadki wymagające decyzji
+człowieka (status \fBfailed\fR z tool JESZCZE obecnym w repo, pakiet
+zniknięty z backendu hosta) nadal tylko sugerują komendę.
 .TP
-.B zpm own list \fR[\fB\-\-json\fR]\fR, \fBzpm own info \fInazwa\fR [\fB\-\-json\fR]
-Listuje/opisuje narzędzia z custom/own-repository.json.
+.B zpm security selftest
+(v0.3.2) Realny test izolacji \fBbwrap\fR: z wnętrza piaskownicy próbuje
+połączyć się z siecią i zapisać poza dozwolony katalog, zamiast czytać
+konfigurację na słowo. Kończy się kodem \fB1\fR, jeśli którykolwiek
+krytyczny test (izolacja sieci/zapisu) nie przejdzie -- nadaje się do
+CI. NIE zastępuje zewnętrznego, ludzkiego przeglądu bezpieczeństwa.
+.TP
+.B zpm own list \fR[\fB\-\-json\fR] [\fB\-\-tag=\fItag\fR]\fR, \fBzpm own info \fInazwa\fR [\fB\-\-json\fR]
+Listuje/opisuje narzędzia z custom/own-repository.json. \fB\-\-tag\fR
+filtruje po tagu zdefiniowanym w repo (np. \fB\-\-tag=kernel\fR).
 .TP
 .B zpm own build \fInazwa\fR
 (Tylko typ "git") Buduje ze źródeł, z zależnościami, bez instalacji.
 .TP
-.B zpm own install \fInazwa...\fR [\fB\-\-force\fR]
+.B zpm own install \fInazwa\fR[\fB@\fIwersja\fR][...] [\fB\-\-force\fR] [\fB\-\-branch=\fIsystem\fR]
 Instaluje narzędzie(a) "own" (binarne lub git, z zależnościami;
-idempotentnie). v0.2: nieudana instalacja jednego z wielu podanych
-naraz pakietów cofa (rollback) te, które udało się zainstalować W TYM
-SAMYM wywołaniu (patrz \fBsecurity.rollback_on_failure\fR w
-\fBzpm.conf\fR(5)).
+idempotentnie). \fInazwa@wersja\fR (v0.5) wymusza DOKŁADNĄ wersję
+podstawianą za \fB{version}\fR w polu \fBbin\fR -- bez niej zpm sam
+ustala najnowszą tam, gdzie \fBbin\fR tego wymaga. \fB\-\-branch=\fR
+(alias \fB\-\-system=\fR) wybiera alternatywny wariant/system narzędzia
+(patrz \fBzpm own systems\fR). v0.2: nieudana instalacja jednego z wielu
+podanych naraz pakietów cofa (rollback) te, które udało się
+zainstalować W TYM SAMYM wywołaniu (patrz \fBsecurity.rollback_on_failure\fR
+w \fBzpm.conf\fR(5)).
+.TP
+.B zpm own systems \fInazwa\fR\fR, \fBzpm own branches \fInazwa\fR
+(v0.5) Listuje alternatywne systemy/warianty (np. \fBstable\fR,
+\fBrolling\fR) zdefiniowane dla narzędzia -- do użycia z
+\fB\-\-branch=\fR przy \fBown install\fR.
 .TP
 .B zpm own remove \fInazwa...\fR [\fB\-\-force\fR]
 .TP
@@ -73,15 +111,41 @@ Buduje/instaluje WSZYSTKIE narzędzia z danym \fBstage\fR (bootstrap).
 .B zpm own verify\-reproducible \fInazwa\fR
 Buduje dwukrotnie i porównuje wynik (fixed-point / reprodukowalność).
 .TP
-.B zpm lock \fR[\fInazwa...\fR]
-(Ponownie) pinuje zpm.lock: dokładne commity/sha256.
-.TP
 .B zpm pack \fIkatalog\fR \fB\-\-name=\fRN \fB\-\-pkg\-version=\fRV [\fB\-\-arch=\fRA] [\fB\-\-depends=\fRa,b]
-Buduje recipe.janet i pakuje do formatu natywnego .zpk.
+Buduje recipe.janet i pakuje do formatu natywnego .zpk. Dla wielu
+architektur naraz (v0.4) uruchom raz na architekturę -- zpk sam składa
+manifest wieloarchitekturowy przy publikacji (patrz \fBzpk\fR(1),
+\fBzpk schedule-release\fR).
 .TP
 .B zpm init \fR[\fB\-\-trust\-keys=\fIplik\fR]
 Inicjalizuje bazę hosta. v0.2: \fB\-\-trust\-keys\fR REALNIE importuje
 i persystuje zestaw zaufanych fingerprintów/kluczy GPG.
+.SH KOMENDY (TRYB ATOMOWY, binarka \-d:atomic)
+.TP
+.B zpm atomic create \fInazwa\fR [\fB\-\-base=\fIobraz\fR] [\fB\-\-engine=podman|buildah|chroot|nspawn\fR] [\fB\-\-memory=\fR4g] [\fB\-\-cpus=\fR2]
+Tworzy nowy kontener atomowy. \fB\-\-engine=chroot\fR/\fBnspawn\fR: \fB\-\-base\fR
+to ścieżka do lokalnego archiwum rootfs (.tar/.tar.gz), bez podman/buildah
+-- \fBnspawn\fR (v0.3.2, wymaga \fBsystemd-nspawn\fR w PATH) daje własne
+przestrzenie nazw (PID/mount/UTS), \fBchroot\fR dzieli je z hostem.
+.TP
+.B zpm atomic install \fInazwa\fR \fIpakiet\fR
+Instaluje pakiet w izolacji (wykrywa menedżer pakietów wewnątrz rootfs).
+.TP
+.B zpm atomic enter \fInazwa\fR
+Wchodzi interaktywnie do kontenera (chroot/nspawn shell albo `podman exec`).
+.TP
+.B zpm atomic list
+Listuje kontenery atomowe.
+.TP
+.B zpm atomic destroy \fInazwa\fR
+Usuwa kontener atomowy.
+.TP
+.B zpm atomic selftest \fInazwa\fR
+(v0.3.2) Weryfikuje, że overlayfs kontenera REALNIE izoluje zapisy --
+pisze/czyta/usuwa plik testowy przez \fBrootfs/\fR i sprawdza, że ląduje
+w \fBupper/\fR (warstwa COW), a \fBlower/\fR (obraz bazowy) pozostaje
+nietknięty, zamiast czytać metadane na słowo. Kod wyjścia \fB1\fR przy
+niepowodzeniu -- nadaje się do CI.
 .SH TRYB BUDOWANIA OBRAZÓW (dla zlb, nigdy nie dotyka hosta)
 .TP
 .B zpm \-\-root=\fIścieżka\fR [\-\-backend=apt|dnf|pacman|zypper|brew|own] init [\-\-trust\-keys=\fIplik\fR]
@@ -107,6 +171,17 @@ Użyj lokalnej bazy w $HOME/.local/share/zpm/zpm.db.
 .B \-\-trust\-keys=\fIplik\fR
 (Z \fBinit\fR) zaufaj zestawowi kluczy repo z pliku.
 .TP
+.B \-\-pubkey=\fIklucz\fR
+(Z \fBverify\fR) klucz publiczny PEM do weryfikacji jednorazowej, zamiast
+zestawu zaufanego przez \fB\-\-trust\-keys\fR.
+.TP
+.B \-\-tag=\fItag\fR
+(Z \fBown list\fR) filtruje narzędzia po tagu z own-repository.json.
+.TP
+.B \-\-branch=\fIsystem\fR\fR, \fB\-\-system=\fIsystem\fR
+(Z \fBown install\fR) wybiera alternatywny wariant narzędzia (patrz
+\fBzpm own systems\fR) -- oba warianty flagi to synonimy.
+.TP
 .B \-\-offline
 Nie dotykaj sieci -- tylko lokalny cache/bundle/zpm.lock.
 .TP
@@ -116,6 +191,14 @@ Architektura docelowa (cross-compilation), np. aarch64.
 .B \-\-json
 Strukturalne wyjście JSON zamiast tekstu (v0.2: honorowane teraz
 spójnie przez WSZYSTKIE komendy, nie tylko \fBlist\fR/\fBown list\fR).
+.TP
+.B \-\-log\-file=\fIścieżka\fR
+(v0.3.2, albo zmienna \fB$ZPM_LOG_FILE\fR) Dopisuje log strukturalny
+NDJSON (\fBts\fR/\fBlevel\fR/\fBcomponent\fR/\fBmsg\fR, jeden wiersz na
+zdarzenie) do pliku -- NIEZALEŻNIE od \fB\-\-quiet\fR/\fB\-\-json\fR,
+myślany do zgrepowania/sparsowania w logach CI. To DRUGI, osobny kanał
+względem \fB\-\-json\fR (który zastępuje wyjście KOMENDY wynikiem
+maszynowym) -- ten dokłada ślad WSZYSTKIEGO, co się działo.
 .TP
 .B \-\-verbose
 Więcej szczegółów diagnostycznych (v0.2: postęp pobierania, cgroups
@@ -128,7 +211,8 @@ Tylko błędy/wynik końcowy.
 Pomiń idempotencję / reverse-dependency check.
 .TP
 .B \-\-fix
-(Z \fBdoctor\fR) napraw automatycznie to, co bezpieczne.
+(Z \fBdoctor\fR) napraw automatycznie to, co bezpieczne (patrz opis
+\fBzpm doctor\fR wyżej -- v0.3.2 rozszerzone o wpisy podwójnie osierocone).
 .TP
 .BR \-h ", " \-\-help
 .TP
@@ -137,18 +221,27 @@ Pomiń idempotencję / reverse-dependency check.
 .TP
 .I /etc/zpm/config.hcl
 Konfiguracja główna (sekcje \fBsecurity\fR, \fBstate\fR, \fBcache\fR,
-\fBcustom\fR, \fBnative\fR, \fBatomic\fR...).
+\fBcustom\fR, \fBnative\fR, \fBatomic\fR, \fBlogging\fR (v0.3.2, patrz
+\fBstructured_log_path\fR)...).
 .TP
 .I /var/lib/zpm/zpm.db
-Baza SQLite pakietów zainstalowanych przez zpm.
+Baza SQLite pakietów zainstalowanych przez zpm. v0.3.2: schemat
+wersjonowany (\fBschema_meta\fR), migrowany automatycznie przy otwarciu
+-- patrz \fBzpm doctor\fR dla bieżącej wersji schematu.
 .TP
 .I /var/lib/zpm/trusted-keys.list
 v0.2: zaufane fingerprinty GPG (z \fBzpm init \-\-trust\-keys\fR).
 .TP
 .I /var/cache/zpm/http
 v0.2: cache HTTP (ETag/Last-Modified) dla refresh/indeksu natywnego.
+.SH ZASTRZEŻENIE (v0.3.2)
+Kod bezpieczeństwa (piaskownica, podpisy, staging) przeszedł automatyczne
+selftesty (\fBzpm security selftest\fR, \fBzpm atomic selftest\fR), ale
+NIE zewnętrzny, ludzki przegląd bezpieczeństwa -- traktuj to jako
+prototyp do czasu takiego przeglądu.
 .SH ZOBACZ TAKŻE
 .BR zlb (1),
+.BR zpk (1),
 dokumentacja online: https://github.com/Zenit-Linux/zpm
 .SH AUTORZY
 Zenit Linux Developers.
