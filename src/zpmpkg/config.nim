@@ -72,6 +72,7 @@ proc defaultConfig*(): ZpmConfig =
 
     jsonOutput: false,
     verbosity: 0,
+    structuredLogPath: "",
 
     targetArch: "",
 
@@ -186,6 +187,13 @@ proc loadConfig*(path: string = DefaultConfigPath): ZpmConfig =
   let ccache = root.findBlock("ccache")
   if ccache != nil:
     result.ccacheDir = ccache.getStr("dir", result.ccacheDir)
+
+  # ---- logging { } -- v0.3.2: logi strukturalne (NDJSON) do CI -----------
+  let loggingBlk = root.findBlock("logging")
+  if loggingBlk != nil:
+    result.structuredLogPath = loggingBlk.getStr("structured_log_path", result.structuredLogPath)
+  # `ZPM_LOG_FILE`/`--log-file=<ścieżka>` (patrz zpm.nim) mają PIERWSZEŃSTWO
+  # nad configiem -- ustawiane runtime, po loadConfig(), tak samo jak --json/--quiet.
 
   # ---- native { } -- natywny format pakietów (.zpk / bkZenitNat) ----------
   let native = root.findBlock("native")
