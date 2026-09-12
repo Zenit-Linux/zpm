@@ -34,6 +34,22 @@ import ./logging
 ##      przywraca nadpisane z backupu (lepsza, choć wciąż nie w 100%
 ##      idealna, atomowość -- pełna atomowa podmiana to zadanie Trybu
 ##      Atomowego / overlayfs, patrz README).
+##
+## v0.3.2 -- UCZCIWIE: (1) i (2) to wciąż klasyczny wzorzec "sprawdź, potem
+## zrób" (TOCTOU) -- między `anyAncestorIsSymlink` a faktycznym
+## `createDir`/`copyFile`/`moveFile` istnieje okno czasowe, w którym
+## RÓWNOLEGŁY proces z dostępem do `rootPath` mógłby podmienić katalog
+## nadrzędny na symlink. Bez przepisania na prymitywy `openat(2)` z
+## `O_NOFOLLOW` (brak wygodnego wsparcia w std/os bez FFI) nie da się tego
+## okna zamknąć W 100% -- ale można je ZAUWAŻYĆ. `verifyWriteLandedInRoot`
+## niżej to druga, NIEZALEŻNA warstwa: PO każdym zapisie ponownie
+## rozwiązuje (`expandFilename`, czyli realpath) ścieżkę pliku, który
+## właśnie napisaliśmy, i porównuje z `rootPath` -- jeśli się rozjeżdżają
+## (bo jakiś katalog PO drodze okazał się symlinkiem podstawionym w
+## międzyczasie), traktuje to jako błąd fatalny i cofa CAŁY merge, zamiast
+## po cichu zostawić plik zapisany poza `rootPath`. To przesunięcie z
+## "zapobiegaj" na "zapobiegaj I wykryj po fakcie" -- typowa, uczciwa
+## odpowiedź na TOCTOU, gdy pełna eliminacja wymaga głębszej przebudowy.
 
 type
   StagingValidationError* = object of CatchableError
@@ -66,6 +82,24 @@ proc anyAncestorIsSymlink(rootPath, relPath: string): tuple[bad: bool, at: strin
       if symlinkExists(acc):
         return (true, acc)
   (false, "")
+
+proc verifyWriteLandedInRoot(rootPath, dst: string): tuple[ok: bool, reason: string] =
+  ## v0.3.2 -- druga warstwa obrony TOCTOU (patrz komentarz modułu):
+  ## wołane TUŻ PO zapisie `dst`, rozwiązuje realną (post-symlink) ścieżkę
+  ## zarówno `dst`, jak i `rootPath`, i sprawdza, że pierwsza faktycznie
+  ## leży pod drugą. Wykrywa (choć nie zapobiega z wyprzedzeniem) sytuację,
+  ## w której katalog nadrzędny został podmieniony na symlink MIĘDZY
+  ## wcześniejszym `anyAncestorIsSymlink` a samym zapisem.
+  let realRoot =
+    try: expandFilename(rootPath)
+    except CatchableError: rootPath
+  let realDst =
+    try: expandFilename(dst)
+    except CatchableError: dst
+  if realDst == realRoot or realDst.startsWith(realRoot & DirSep):
+    return (true, "")
+  (false, &"po zapisie '{dst}' faktycznie rozwiązuje się do '{realDst}', poza rootPath '{realRoot}' " &
+    "-- najprawdopodobniej katalog nadrzędny został podmieniony na symlink W TRAKCIE merge'a (TOCTOU)")
 
 proc freeBytes(path: string): BiggestInt =
   ## `statvfs` przez `df -Pk` (przenośne, bez FFI) -- ile wolnego miejsca
@@ -161,6 +195,12 @@ proc safeMergeStaging*(stagingDir, rootPath: string): MergeResult =
       if dirExists(src):
         if not dirExists(dst) and not symlinkExists(dst):
           createDir(dst)
+          let (landedOk, landedErr) = verifyWriteLandedInRoot(rootPath, dst)
+          if not landedOk:
+            acc = MergeResult(ok: false, createdPaths: acc.createdPaths & @[dst],
+                               backedUpPaths: acc.backedUpPaths, error: landedErr)
+            rollback(acc)
+            return acc
           acc.createdPaths.add dst
         continue
 
@@ -191,6 +231,12 @@ proc safeMergeStaging*(stagingDir, rootPath: string): MergeResult =
         except CatchableError:
           discard
       moveFile(tmpDst, dst)
+      let (landedOk, landedErr) = verifyWriteLandedInRoot(rootPath, dst)
+      if not landedOk:
+        acc = MergeResult(ok: false, createdPaths: acc.createdPaths,
+                           backedUpPaths: acc.backedUpPaths, error: landedErr)
+        rollback(acc)
+        return acc
   except CatchableError as e:
     acc = MergeResult(ok: false, createdPaths: acc.createdPaths,
                        backedUpPaths: acc.backedUpPaths,
