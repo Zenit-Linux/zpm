@@ -170,6 +170,17 @@ proc safeDownloadFile*(url, dest: string, cfg: ZpmConfig, label: string = "zpm:n
     (true, "")
   except CatchableError as e:
     stderr.writeLine(&"[{label}] ✘ Pobieranie {url} nie powiodło się: {e.msg}")
+    # v0.3.2 -- diagnostyka dla NAJCZĘSTSZEJ przyczyny 404 przy pobieraniu
+    # narzędzi `own`: URL z `{version}` podstawionym z tagu GitHub Releases
+    # (np. "v0.2") nie musi być tym samym stringiem, co człon wersji w
+    # NAZWIE PLIKU assetu wydania (np. "zpk-0.2.0-x86_64.zpk" przy tagu
+    # "v0.2" -- "v0.2" ≠ "0.2.0"). To NIE jest błąd zpm ani sieci -- to
+    # niespójność w procesie wydawniczym repo, z którego coś instalujemy.
+    if "404" in e.msg or "Not Found" in e.msg:
+      stderr.writeLine(&"[{label}]   Podpowiedź: 404 przy URL-u zawierającym wersję zwykle oznacza, że " &
+        "nazwa assetu w wydaniu NIE zgadza się dokładnie z tagiem release'a " &
+        "(np. tag 'v0.2', ale plik nazwany 'nazwa-0.2.0-x86_64.zpk') -- to trzeba poprawić " &
+        "w repo/CI narzędzia, nie w zpm. Sprawdź stronę wydań pod kątem faktycznej nazwy pliku.")
     (false, e.msg)
 
 # ---------------------------------------------------------------------------
