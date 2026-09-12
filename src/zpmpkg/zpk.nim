@@ -1,4 +1,4 @@
-import std/[json, os, osproc, strutils, strformat, times, sequtils, algorithm]
+import std/[json, os, osproc, strutils, strformat, times, sequtils, algorithm, sets]
 import ./types
 import ./lockfile
 import ./netutil
@@ -97,6 +97,83 @@ proc extractManifestFromArchive*(zpkPath: string): tuple[ok: bool, manifest: Zpk
   except CatchableError as e:
     (false, ZpkManifest(), &"'{ManifestFileName}' wewnątrz {zpkPath} nie jest poprawnym JSON-em: {e.msg}")
 
+proc listArchiveMembers*(zpkPath: string): tuple[ok: bool, members: seq[string], err: string] =
+  ## v0.3.2 -- NAPRAWA KRYTYCZNEJ LUKI BEZPIECZEŃSTWA, znalezionej i
+  ## zademonstrowanej na żywo: `verifyZpkArchive` sprawdzała integralność
+  ## WYŁĄCZNIE plików WYMIENIONYCH w `manifest.files`, a `installZpk`
+  ## rozpakowywało CAŁE archiwum (`tar -xf`, bez ograniczeń) -- pakiet
+  ## mógł więc zadeklarować w manifeście 1 niewinny plik (przechodzący
+  ## sha256/podpis bez zarzutu), a FIZYCZNIE zawierać w archiwum dowolne
+  ## inne pliki (np. `/etc/cron.d/...`), które trafiały na system PRZY
+  ## INSTALACJI całkowicie bez weryfikacji i bez wpisu w pokwitowaniu
+  ## (więc `zpm remove` też ich nie usuwał). Potwierdzone empirycznie:
+  ## `zpm verify` zwracało "zweryfikowany pomyślnie", a `zpm install`
+  ## faktycznie zapisywało przemycony plik na dysku.
+  ##
+  ## Ta funkcja listuje WSZYSTKICH członków archiwum (bez rozpakowywania
+  ## -- `tar -tf`), normalizując prefiks "./" i pomijając wpisy katalogów
+  ## (kończące się na "/") -- do porównania z `manifest.files` przez
+  ## `checkArchiveMembersMatchManifest` niżej.
+  let (output, code) = execCmdEx(&"tar -tf {quoteShell(zpkPath)}")
+  if code != 0:
+    return (false, @[], &"nie udało się wylistować zawartości {zpkPath} (kod {code})")
+  var members: seq[string] = @[]
+  for rawLine in output.splitLines():
+    var m = rawLine.strip()
+    if m.len == 0: continue
+    if m == "." or m == "./": continue
+    if m.startsWith("./"): m = m[2 .. ^1]
+    if m.endsWith("/"): continue  # wpis katalogu, nie plik -- pomijamy
+    members.add m
+  (true, members, "")
+
+proc checkArchiveMembersMatchManifest*(zpkPath: string, manifest: ZpkManifest): tuple[ok: bool, messages: seq[string]] =
+  ## Odrzuca archiwum, jeśli zawiera JAKIKOLWIEK plik nieobecny w
+  ## `manifest.files` (poza samym `manifest.json`) -- allowlist, nie
+  ## blocklist: brak w manifeście = odrzucone, niezależnie od tego, co
+  ## to za plik. Zgłasza też odwrotność (plik zadeklarowany w manifeście,
+  ## którego fizycznie nie ma w archiwum) dla kompletności diagnostyki,
+  ## choć to i tak złapie późniejsze porównanie sha256.
+  ##
+  ## v0.3.2 -- dodatkowo odrzuca ścieżki ABSOLUTNE (`/etc/passwd`) i
+  ## zawierające segment `..` (`../../etc/passwd`) -- ta sama klasa
+  ## problemu co przemycone pliki (instalator pisze POZA zamierzonym
+  ## `rootPath`), ale przez inny wektor: samą NAZWĘ ścieżki zamiast
+  ## rozjazdu manifest/archiwum. `tar -C root -xf ... -- path` honoruje
+  ## `..` w nazwie członka i zapisze GDZIE TA ŚCIEŻKA WSKAZUJE, nie tylko
+  ## wewnątrz `root` -- bez tej kontroli allowlista z manifestu nie
+  ## chroniłaby przed pakietem, który sam siebie jawnie deklaruje z takim
+  ## polem `path`.
+  let (listOk, members, listErr) = listArchiveMembers(zpkPath)
+  if not listOk:
+    return (false, @[listErr])
+  var messages: seq[string] = @[]
+  var ok = true
+  for f in manifest.files:
+    if f.path == ManifestFileName: continue
+    if f.path.isAbsolute or ".." in f.path.split('/'):
+      ok = false
+      messages.add &"NIEBEZPIECZNA ścieżka w manifest.files: '{f.path}' (absolutna albo z '..') -- odrzucam cały pakiet"
+  var declared = initHashSet[string]()
+  for f in manifest.files:
+    if f.path != ManifestFileName: declared.incl f.path
+  for m in members:
+    if m == ManifestFileName: continue
+    if m.isAbsolute or ".." in m.split('/'):
+      ok = false
+      messages.add &"NIEBEZPIECZNA ścieżka w archiwum: '{m}' (absolutna albo z '..') -- odrzucam cały pakiet"
+      continue
+    if m notin declared:
+      ok = false
+      messages.add &"PRZEMYCONY plik w archiwum, NIEOBECNY w manifest.files: '{m}' -- odrzucam cały pakiet"
+  var inArchive = initHashSet[string]()
+  for m in members: inArchive.incl m
+  for f in manifest.files:
+    if f.path != ManifestFileName and f.path notin inArchive:
+      ok = false
+      messages.add &"plik zadeklarowany w manifeście, ale NIEOBECNY fizycznie w archiwum: '{f.path}'"
+  (ok, messages)
+
 proc verifyZpkArchive*(zpkPath: string, publicKeyPath: string = ""): tuple[ok: bool, manifest: ZpkManifest, messages: seq[string]] =
   ## `zpm verify <plik.zpk>` -- odpowiednik `zpk verify`, na wypadek gdy
   ## operator ma pod ręką tylko `zpm` (albo instaluje pakiety zbudowane
@@ -104,11 +181,20 @@ proc verifyZpkArchive*(zpkPath: string, publicKeyPath: string = ""): tuple[ok: b
   ## do katalogu tymczasowego, przelicza sha256 każdego pliku ładunku i
   ## zagregowaną sumę od nowa (integralność), i jeśli manifest niesie
   ## podpis -- weryfikuje go względem `publicKeyPath` (autentyczność).
+  ##
+  ## v0.3.2 -- PIERWSZY krok teraz to `checkArchiveMembersMatchManifest`
+  ## (patrz komentarz tam) -- odrzuca pakiet z przemyconymi plikami
+  ## PRZED jakąkolwiek weryfikacją sha256/podpisu, więc `zpm verify`
+  ## faktycznie łapie to, co wcześniej przechodziło bez zarzutu.
   var messages: seq[string] = @[]
   var ok = true
   let (gotManifest, manifest, err) = extractManifestFromArchive(zpkPath)
   if not gotManifest:
     return (false, ZpkManifest(), @[err])
+
+  let (membersOk, memberMessages) = checkArchiveMembersMatchManifest(zpkPath, manifest)
+  if not membersOk:
+    return (false, manifest, memberMessages)
 
   let extractDir = getTempDir() / &"zpm-verify-{$epochTime().int}-{getCurrentProcessId()}"
   createDir(extractDir)
@@ -308,21 +394,48 @@ proc installZpk*(zpkPath, rootPath: string, cfg: ZpmConfig, manifest: ZpkManifes
   ## sukcesie zapisuje `ZpkInstallReceipt` (lista plików z manifestu) --
   ## BEZ TEGO `zpm remove` dla tego backendu nie ma jak wiedzieć, co
   ## dokładnie skasować.
+  ##
+  ## v0.3.2 -- OBRONA W GŁĄB dla tej samej luki co `checkArchiveMembersMatchManifest`
+  ## (patrz komentarz tam, potwierdzone na żywo demo przemycenia pliku do
+  ## /etc/cron.d/ mimo "zweryfikowanego" pakietu): NAWET jeśli ktoś w
+  ## przyszłości doda ścieżkę wołającą `installZpk` bez uprzedniego
+  ## `verifyAndReport`/`checkArchiveMembersMatchManifest` (dziś tak nie
+  ## jest -- oba obecni wołający zawsze weryfikują najpierw), ta funkcja
+  ## SAMA odmawia rozpakować cokolwiek spoza `manifest.files`: zamiast
+  ## `tar -xf` (CAŁE archiwum, bez ograniczeń), rozpakowuje WYŁĄCZNIE
+  ## jawnie wymienione ścieżki (`tar -xf zpkPath -- manifest.json <p1> <p2> ...`)
+  ## -- allowlist, nie post-hoc sprzątanie. Dodatkowo re-weryfikuje listę
+  ## członków PRZED rozpakowaniem (na wypadek gdy `verify` i `install`
+  ## dostały RÓŻNE kopie tego samego pliku, np. podmienione między
+  ## wywołaniami -- mało prawdopodobne, ale tani do sprawdzenia dodatkowo).
   if not fileExists(zpkPath):
     stderr.writeLine(&"[zpm:native] ✘ Brak pliku {zpkPath}.")
     return 1
+  let (membersOk, memberMessages) = checkArchiveMembersMatchManifest(zpkPath, manifest)
+  if not membersOk:
+    for msg in memberMessages:
+      stderr.writeLine(&"[zpm:native] ✘ {zpkPath}: {msg}")
+    stderr.writeLine("[zpm:native] ✘ Odmawiam instalacji -- archiwum zawiera pliki spoza manifestu.")
+    return 1
   let root = if rootPath.len > 0: rootPath else: "/"
   createDir(root)
-  let code = execCmd(&"tar -C \"{root}\" -xf \"{zpkPath}\"")
-  if code != 0:
-    stderr.writeLine(&"[zpm:native] ✘ Rozpakowanie {zpkPath} do {root} nie powiodło się (kod {code}).")
-    return code
   # `manifest.json` sam trafia do stagingu/archiwum przy budowaniu (patrz
   # `zpk build`) -- nie chcemy go liczyć jako "plik pakietu" do
   # ewentualnego usunięcia razem z resztą (to metadane, nie zawartość pakietu).
   var files: seq[ZpkFileEntry] = @[]
   for f in manifest.files:
     if f.path != ManifestFileName: files.add f
+  if files.len == 0:
+    stderr.writeLine(&"[zpm:native] ✘ {zpkPath}: manifest nie deklaruje ŻADNYCH plików ładunku.")
+    return 1
+  var args = @["-C", root, "-xf", zpkPath, "--"]
+  for f in files: args.add f.path
+  let process = startProcess("tar", args = args, options = {poUsePath, poParentStreams})
+  let code = process.waitForExit()
+  process.close()
+  if code != 0:
+    stderr.writeLine(&"[zpm:native] ✘ Rozpakowanie {zpkPath} do {root} nie powiodło się (kod {code}).")
+    return code
   saveNativeReceipt(cfg, ZpkInstallReceipt(
     name: manifest.name, version: manifest.version, rootPath: root,
     files: files, installedAt: nowIso8601()
@@ -379,7 +492,7 @@ proc installNative*(cfg: ZpmConfig, name, rootPath: string): int =
     return 1
   installZpk(cachedPath, rootPath, cfg, manifest)
 
-proc installLocalZpk*(zpkPath, rootPath: string, cfg: ZpmConfig): int =
+proc installLocalZpk*(zpkPath, rootPath: string, cfg: ZpmConfig): tuple[code: int, manifest: ZpkManifest] =
   ## v0.4 -- instalacja BEZPOŚREDNIO z lokalnego pliku `.zpk` (np. `zpm
   ## install ./moj-pakiet-1.0.0-x86_64.zpk`), BEZ przechodzenia przez
   ## indeks repozytorium -- wcześniej jedyną drogą do zainstalowania
@@ -389,10 +502,26 @@ proc installLocalZpk*(zpkPath, rootPath: string, cfg: ZpmConfig): int =
   ## pobrany ręcznie skądinąd nie dał się zainstalować wprost.
   ## Manifest wyciągany jest Z ARCHIWUM (v0.4, patrz `extractManifestFromArchive`),
   ## nie z osobnego pliku obok -- ten sam kontrakt co `zpm verify`.
+  ##
+  ## v0.3.2 -- NAPRAWA REALNEGO BUGA, znalezionego przez faktyczne
+  ## uruchomienie `zpm install plik.zpk` na żywo: ta funkcja (w
+  ## przeciwieństwie do `installOne`/`installViaBackend` dla instalacji
+  ## PO NAZWIE) nigdy nie zwracała manifestu -- wołający (`zpm.nim`) nie
+  ## miał WIĘC jak zapisać pakietu w bazie SQLite (`db.recordInstall`).
+  ## Efekt zweryfikowany na żywo: `zpm install plik.zpk` kończył się
+  ## sukcesem (pliki realnie na dysku, pokwitowanie natywne zapisane),
+  ## ale `zpm list` (bez `--all`) pokazywał pakiet jako nieistniejący,
+  ## `zpm doctor` milczał (bo iteruje WYŁĄCZNIE `db.listInstalled()`), a
+  ## `zpm remove <nazwa>` odpowiadał "Pakiet nie jest śledzony przez zpm"
+  ## i nie robił KOMPLETNIE nic -- pliki zainstalowane przez lokalny
+  ## `.zpk` nie dały się usunąć przez UDOKUMENTOWANY interfejs w ogóle.
+  ## Teraz zwraca manifest, żeby `zpm.nim` mogło zapisać instalację (albo
+  ## niepowodzenie) w bazie dokładnie tak samo, jak robi to dla
+  ## wszystkich innych backendów (patrz `installOne` w orchestrator.nim).
   let (verifyOk, manifest) = verifyAndReport(cfg, zpkPath)
   if not verifyOk:
-    return 1
-  installZpk(zpkPath, rootPath, cfg, manifest)
+    return (1, manifest)
+  (installZpk(zpkPath, rootPath, cfg, manifest), manifest)
 
 proc removeNative*(cfg: ZpmConfig, name, rootPath: string): int =
   ## Realne usuwanie pakietu `.zpk` -- dokładnie te pliki, które
