@@ -1,4 +1,4 @@
-import std/[os, osproc, strformat, strutils]
+import std/[os, osproc, strformat, strutils, sequtils, times]
 
 ## v0.3 -- wspólne prymitywy silnika kontenerów, wyodrębnione z atomic.nim
 ## (który zostaje "właścicielem" komend `zpm atomic ...`), żeby dokładnie
@@ -11,9 +11,34 @@ import std/[os, osproc, strformat, strutils]
 proc detectContainerEngine*(): string =
   ## Preferuje podman (najbardziej rozpowszechniony rootless engine w
   ## Zenit), buildah jako fallback (środowiska bez demona/CI minimalne).
+  ## v0.3.2: `systemd-nspawn` NIE jest tu autodetekowane celowo -- w
+  ## przeciwieństwie do podman/buildah nie ma pojęcia "obrazu z rejestru",
+  ## tylko gotowy katalog/obraz rootfs na dysku, więc wybór go wymaga
+  ## jawnego `--engine=nspawn` (patrz `atomic.nim`), nie autodetekcji.
   if findExe("podman").len > 0: "podman"
   elif findExe("buildah").len > 0: "buildah"
   else: ""
+
+proc nspawnAvailable*(): bool =
+  findExe("systemd-nspawn").len > 0
+
+proc nspawnRun*(rootfs: string, cmdInside: string, extraArgs: string = ""): tuple[ok: bool, output: string] =
+  ## v0.3.2 -- wsparcie dla `systemd-nspawn` jako TRZECI silnik obok
+  ## podman/buildah (domyka lukę "systemd-nspawn wciąż niewspierany" z
+  ## README). W przeciwieństwie do `chroot` (patrz atomic.nim), nspawn daje
+  ## własne przestrzenie nazw (PID/mount/UTS/sieć z `--private-network`) bez
+  ## demona kontenerowego -- pośrednie rozwiązanie między "goły chroot" a
+  ## "pełny podman". Wymaga zainstalowanego `systemd-container`
+  ## (`systemd-nspawn` w PATH) i zwykle uprawnień roota (albo
+  ## `--private-users=pick` w środowiskach z user namespaces).
+  if not nspawnAvailable():
+    return (false, "systemd-nspawn nie jest w PATH (pakiet 'systemd-container' na większości dystrybucji)")
+  let cmd = &"systemd-nspawn --quiet -D \"{rootfs}\" {extraArgs} -- sh -c '{cmdInside}'"
+  let (output, code) = execCmdEx(cmd)
+  (code == 0, output)
+
+proc nspawnEnter*(rootfs: string, extraArgs: string = "") =
+  discard execCmd(&"systemd-nspawn -D \"{rootfs}\" {extraArgs}")
 
 proc exportImageToLower*(engine, baseImage, lowerDir: string): bool =
   ## Eksportuje warstwę bazową obrazu (rootfs) do `lowerDir`, żeby overlayfs
@@ -100,6 +125,73 @@ proc installCmdFor*(mgr, pkg: string): string =
   of "apk": &"apk add --no-cache {pkg}"
   of "zypper": &"zypper --non-interactive install {pkg}"
   else: ""
+
+proc overlaySelfTest*(dir: string): tuple[ok: bool, report: seq[string]] =
+  ## v0.3.2 -- domyka luką "cross-distro/overlayfs zadeklarowane, ale
+  ## nieprzetestowane na żywym systemie". Zamiast wierzyć kodowi na słowo
+  ## po `mountOverlay()`, PISZE realny plik testowy przez `rootfs/` (widok
+  ## zamontowany) i weryfikuje WSZYSTKIE właściwości, które Tryb Atomowy
+  ## obiecuje w README:
+  ##   1. plik zapisany przez rootfs/ faktycznie ląduje w upper/ (warstwa
+  ##      COW zarządzana przez zpm), a NIE w lower/ (obraz bazowy, ma
+  ##      zostać nietknięty -- to jest cały sens "atomowości": commit/
+  ##      rollback operuje na upper/, nie na całym rootfs).
+  ##   2. treść odczytana z powrotem przez rootfs/ zgadza się z tym, co
+  ##      zapisano (overlay faktycznie pośredniczy w odczycie, nie tylko
+  ##      w zapisie).
+  ##   3. usunięcie pliku przez rootfs/ jest widoczne przez rootfs/ (nie
+  ##      zostawia "widma" z lower/ przez whiteout źle obsłużony).
+  ## Zwraca (ok, lista linii raportu) -- wołający (`zpm atomic selftest`)
+  ## decyduje, czy wypisać to jako zwykły tekst czy `--json`.
+  var report: seq[string] = @[]
+  let rootfs = dir / "rootfs"
+  let upper = dir / "upper"
+  let lower = dir / "lower"
+  if not dirExists(rootfs):
+    return (false, @["rootfs/ nie istnieje -- kontener nie ma zamontowanego (ani utworzonego) overlayfs"])
+
+  let marker = &"zpm-overlay-selftest-{getCurrentProcessId()}"
+  let testFile = rootfs / marker
+  let content = "zpm overlay selftest " & $epochTime()
+
+  try:
+    writeFile(testFile, content)
+  except CatchableError as e:
+    return (false, @[&"✘ zapis testowego pliku przez rootfs/ nie powiódł się: {e.msg}"])
+
+  if not fileExists(upper / marker):
+    report.add &"✘ plik zapisany przez rootfs/{marker} NIE pojawił się w upper/ -- overlay nie jest " &
+      "faktycznie zamontowany (albo rootfs/ to zwykły katalog, nie punkt montowania)"
+  else:
+    report.add &"✔ zapis przez rootfs/ trafia do upper/ (COW działa)"
+
+  if fileExists(lower / marker):
+    report.add &"✘ plik zapisany przez rootfs/ wyciekł też do lower/ -- obraz bazowy NIE jest " &
+      "chroniony przed zapisem (to unieważnia całą obietnicę atomowości)"
+  else:
+    report.add "✔ lower/ (obraz bazowy) pozostaje nietknięty po zapisie"
+
+  var readBack = ""
+  try:
+    readBack = readFile(testFile)
+  except CatchableError:
+    discard
+  if readBack != content:
+    report.add "✘ odczyt przez rootfs/ nie zgadza się z tym, co zapisano"
+  else:
+    report.add "✔ odczyt przez rootfs/ zgodny z zapisem"
+
+  try:
+    removeFile(testFile)
+  except CatchableError:
+    discard
+  if fileExists(rootfs / marker):
+    report.add "✘ usunięcie pliku przez rootfs/ nie jest widoczne przez rootfs/ (whiteout nie zadziałał)"
+  else:
+    report.add "✔ usunięcie przez rootfs/ poprawnie ukrywa plik (whiteout)"
+
+  let ok = report.allIt(it.startsWith("✔"))
+  (ok, report)
 
 proc containerSandboxWrap*(image, workDir: string, extraWritable: openArray[string],
                             allowNetwork: bool, cmd: seq[string]): tuple[ok: bool, cmd: seq[string], err: string] =
