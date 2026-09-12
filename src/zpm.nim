@@ -4,6 +4,7 @@ import ./zpmpkg/config
 import ./zpmpkg/database
 import ./zpmpkg/ownrepo
 import ./zpmpkg/logging
+import ./zpmpkg/filelock
 
 when defined(atomic):
   import ./zpmpkg/atomic
@@ -11,8 +12,9 @@ else:
   import ./zpmpkg/orchestrator
   import ./zpmpkg/building
   import ./zpmpkg/zpk
+  import ./zpmpkg/securityselftest
 
-const ZpmVersion = "0.3.0"
+const ZpmVersion = "0.3.2"
 
 proc splitOwnNameVersion(spec: string): tuple[name, version: string] =
   ## v0.5 -- `zpm own install <nazwa>[@<wersja>]`: "@" oddziela DOKŁADNĄ
@@ -42,6 +44,8 @@ proc printHelp() =
     echo "  zpm atomic enter   <nazwa>                  Wchodzi interaktywnie do kontenera"
     echo "  zpm atomic list                             Listuje kontenery atomowe"
     echo "  zpm atomic destroy <nazwa>                  Usuwa kontener atomowy"
+    echo "  zpm atomic selftest <nazwa>                 (v0.3.2) Weryfikuje, że overlayfs REALNIE izoluje"
+    echo "                                               zapisy (upper/ vs lower/) -- nie tylko czyta metadane"
     echo ""
     echo "Konfiguracja: /etc/zpm/config.hcl (sekcja `atomic { store_path = ... }`)"
   else:
@@ -61,6 +65,10 @@ proc printHelp() =
     echo "                                   cargo/npm/pip), wymogi bezpieczeństwa (bwrap/gpg/git w PATH)."
     echo "                                   --fix naprawia automatycznie to, co bezpieczne (osierocone"
     echo "                                   pokwitowania/wpisy locka) -- NIE instaluje/usuwa pakietów."
+    echo "  zpm security selftest             (v0.3.2) Realny test izolacji bwrap: próbuje połączyć się"
+    echo "                                   z siecią i zapisać poza dozwolony katalog Z WNĘTRZA piaskownicy"
+    echo "                                   -- nie czyta configu na słowo, sprawdza efekt. NIE zastępuje"
+    echo "                                   zewnętrznego audytu bezpieczeństwa."
     echo "  zpm own list [--json] [--tag=T]  Listuje narzędzia z custom/own-repository.json"
     echo "                                   (--tag filtruje po tagu, np. --tag=de)"
     echo "  zpm own info    <nazwa> [--json] Szczegóły narzędzia (typ, repo/bin, skrypty, zależności,"
@@ -123,6 +131,9 @@ proc printHelp() =
     echo "  -q, --quiet          tylko błędy/wynik końcowy"
     echo "  -f, --force          pomiń idempotencję / reverse-dependency check (own install/remove, remove)"
     echo "      --fix            (z `doctor`) napraw automatycznie to, co bezpieczne"
+    echo "      --log-file=ŚCIEŻKA  (v0.3.2, albo $ZPM_LOG_FILE) dopisuj log strukturalny NDJSON"
+    echo "                       (ts/level/component/msg) do pliku -- niezależnie od --quiet/--json,"
+    echo "                       do zgrepowania w CI (patrz logging.nim)"
     echo "  -a, --all            (z `list`) widok ujednolicony: SQLite + pokwitowania own + native, z"
     echo "                       oznaczeniem rozjazdów między nimi"
     echo "  -h, --help           pokaż tę pomoc"
@@ -196,6 +207,7 @@ else:
     var pubKeyOpt = ""
     var tagFilter = ""
     var branchOpt = ""
+    var logFile = ""
     var positional: seq[string] = @[]
 
     var p = initOptParser(commandLineParams())
@@ -225,6 +237,7 @@ else:
         of "pubkey": pubKeyOpt = val
         of "tag": tagFilter = val.strip().toLowerAscii()
         of "branch", "system": branchOpt = val.strip()
+        of "log-file": logFile = val  ## v0.3.2 -- patrz logging.nim (kanał NDJSON, niezależny od --json)
         else: discard
       of cmdEnd: discard
 
@@ -235,6 +248,11 @@ else:
     if verbose: cfg.verbosity = 1
     if quiet: cfg.verbosity = -1
     setLogVerbosity(cfg)
+    # v0.3.2 -- --log-file/$ZPM_LOG_FILE mają pierwszeństwo nad
+    # logging.structured_log_path z configu (runtime > plik), tak samo jak
+    # pozostałe flagi powyżej.
+    if getEnv("ZPM_LOG_FILE").len > 0: setStructuredLogPath(getEnv("ZPM_LOG_FILE"))
+    if logFile.len > 0: setStructuredLogPath(logFile)
 
     # `--root` implicitly puts zpm into building mode, matching the
     # ergonomic `zlb` uses: `zpm --root <rootfs> <cmd> ...` -- never
@@ -304,6 +322,15 @@ else:
       let db = openDb(dbPath)
       defer: db.closeDb()
       cmdDoctor(cfg, db, doctorFix)
+      return
+
+    # `zpm security selftest` -- v0.3.2, weryfikuje REALNIE, że piaskownica
+    # bwrap izoluje sieć/zapis tak, jak obiecuje (patrz securityselftest.nim).
+    if positional[0] == "security":
+      if positional.len >= 2 and positional[1] == "selftest":
+        runSecuritySelfTestCli(cfg)
+      else:
+        log("[zpm:security] Użycie: zpm security selftest")
       return
 
     # `zpm own <subkomenda>` -- ekosystem Zenit (custom/own-repository.json).
@@ -431,12 +458,26 @@ else:
       # iść przez wyszukiwanie po backendach (które i tak nie znałoby
       # ścieżki do lokalnego pliku jako "nazwy pakietu"). Reszta
       # argumentów (zwykłe nazwy) idzie normalną ścieżką `cmdInstall`.
+      #
+      # v0.3.2 -- NAPRAWA REALNEGO BUGA (znalezionego na żywo, patrz
+      # komentarz w installLocalZpk/zpk.nim): wynik instalacji lokalnego
+      # `.zpk` jest TERAZ zapisywany w bazie SQLite (`db.recordInstall`/
+      # `recordFailed`), dokładnie tak samo jak dla `cmdInstall` niżej --
+      # wcześniej `zpm remove`/`zpm doctor`/`zpm list` (bez `--all`) w
+      # ogóle nie wiedziały, że taki pakiet istnieje.
       var localFailed = false
       var remaining: seq[string] = @[]
       for arg in positional[1..^1]:
         if arg.toLowerAscii.endsWith(".zpk") and fileExists(arg):
-          if installLocalZpk(arg, "/", cfg) != 0:
-            localFailed = true
+          let (code, manifest) = installLocalZpk(arg, "/", cfg)
+          withLock(cfg.dbPath, cfg.lockTimeoutSec):
+            if code == 0:
+              db.recordInstall(manifest.name, bkZenitNat, manifest.version, "user", arg)
+              log(&"[zpm] ✔ {manifest.name} zapisano w bazie zpm.")
+            else:
+              localFailed = true
+              if manifest.name.len > 0:
+                db.recordFailed(manifest.name, bkZenitNat, "user", arg)
         else:
           remaining.add arg
       if remaining.len > 0:
