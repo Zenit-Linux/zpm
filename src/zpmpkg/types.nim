@@ -370,6 +370,22 @@ type
     jsonOutput*: bool               ## ustawiane runtime przez --json
     verbosity*: int                  ## -1 = --quiet, 0 = domyślny, 1 = --verbose
 
+    # ---- v0.3.2: logi strukturalne (NDJSON) do debugowania w CI ---------------
+    structuredLogPath*: string       ## logging.structured_log_path (albo runtime
+                                      ## --log-file=<ścieżka>/ZPM_LOG_FILE) -- gdy
+                                      ## niepuste, KAŻDA linia log()/logWarn()/logErr()
+                                      ## trafia DODATKOWO (obok zwykłego stdout/stderr,
+                                      ## niezależnie od --quiet/--verbose/--json) jako
+                                      ## jeden wiersz NDJSON do tego pliku: {"ts",
+                                      ## "level", "component", "msg"}. To jest INNY kanał
+                                      ## niż `--json` (który zastępuje ludzki output
+                                      ## maszynowym wynikiem KOMENDY) -- ten tu dokłada
+                                      ## ustrukturyzowany ślad WSZYSTKIEGO, co się działo,
+                                      ## do zgrepowania/sparsowania w logach CI, nawet gdy
+                                      ## komenda sama w sobie nie ma trybu --json (patrz
+                                      ## logging.nim). Puste (domyślnie) = brak zmiany
+                                      ## zachowania sprzed v0.3.2.
+
     # ---- cross-compilation ---------------------------------------------------
     targetArch*: string           ## ustawiane runtime przez --target-arch ("" = arch hosta)
 
