@@ -1,4 +1,4 @@
-import std/[strformat, strutils, threadpool, os, algorithm, times, json, tables, sets]
+import std/[strformat, strutils, os, algorithm, times, json, tables, sets]
 import db_connector/db_sqlite
 import ./types
 import ./config
@@ -13,8 +13,6 @@ import ./trustedkeys
 import ./logging
 import ./crossdistro
 import ./backends/[common, apt, dnf, pacman, zypper, flatpak, snap, cargo, pip, npm, brew]
-
-{.experimental: "parallel".}
 
 proc parsePackageSpec*(raw: string): PackageSpec =
   ## Rozbija wpis pakietu na nazwę + opcjonalny wymuszony backend +
@@ -216,14 +214,19 @@ proc searchAll*(cfg: ZpmConfig, query: string): seq[PackageCandidate] =
   if present.len == 0:
     return
 
-  # Wyszukiwanie równoległe — każdy backend to osobny proces zewnętrzny,
-  # więc dobrze nadaje się do spawn/sync z threadpool.
-  var futures: seq[FlowVar[seq[PackageCandidate]]] = @[]
+  # v0.3.2 -- NAPRAWA REALNEGO BŁĘDU KOMPILACJI (ten sam co w `cmdUpdate`,
+  # patrz komentarz tam): `spawn searchBackend(...)` odmawia się skompilować
+  # ("'spawn' takes a GC safe call expression"), bo `searchBackend` poprzez
+  # `log()`/`logVerbose()` dotyka globalnego stanu modułu `logging`. Zamiast
+  # `threadpool` (przestarzały, i tak nigdy nie skompilowany w tym repo) --
+  # wyszukiwanie sekwencyjne. Realna równoległość (osobne PROCESY per
+  # backend, nie wątki współdzielące stan Nim-a) zostaje do zrobienia
+  # osobno przez `osproc.startProcess` + polling, nie przez `threadpool`.
+  var results: seq[seq[PackageCandidate]] = @[]
   for b in present:
-    futures.add(spawn searchBackend(b, query, cfg))
-
-  for f in futures:
-    result.add(^f)
+    results.add searchBackend(b, query, cfg)
+  for r in results:
+    result.add r
 
   # Sortowanie wg preferowanej kolejności backendów z configu.
   proc prefIndex(b: BackendKind): int =
@@ -364,14 +367,26 @@ proc cmdUpdate*(cfg: ZpmConfig) =
 
   echo &"[zpm] Aktualizuję {present.len} rejestry(-ów): ", present.join(", ")
 
+  # v0.3.2 -- NAPRAWA REALNEGO BŁĘDU KOMPILACJI: poprzednio `cfg.parallelUpdates`
+  # próbowało `spawn` (moduł `threadpool`, przestarzały w Nim 2.x) na
+  # `updateViaBackend`, który poprzez `apt.updateAll()`/`log()`/`echo`
+  # dotyka globalnego stanu (m.in. `logging.gVerbosity`) -- Nim odmawia
+  # takiego `spawn` na etapie kompilacji: "'spawn' takes a GC safe call
+  # expression". To NIE był bug wprowadzony w tej rundzie -- ten kod
+  # nigdy nie został skompilowany (patrz zastrzeżenie w README), więc
+  # błąd czekał od dawna. Zamiast obwieszać cały łańcuch wywołań
+  # (logging -> backends -> ...) pragmą `{.gcsafe.}`/`{.cast(gcsafe).}`
+  # (kruche, łatwo o UB przy współdzielonym stanie bez realnej synchronizacji),
+  # `zpm update` wykonuje się SEKWENCYJNIE zawsze -- `parallelUpdates`
+  # zostaje w configu jako zachowana, ale na razie NIEHONOROWANA opcja
+  # (uczciwie, jedna linia ostrzeżenia przy starcie), do realnej
+  # implementacji przez `osproc.startProcess`+polling zamiast wątków.
   if cfg.parallelUpdates:
-    var futures: seq[FlowVar[int]] = @[]
-    for b in present:
-      futures.add(spawn updateViaBackend(b, cfg))
-    for f in futures: discard ^f
-  else:
-    for b in present:
-      discard updateViaBackend(b, cfg)
+    logWarn("[zpm] ⚠ core.parallel_updates=true, ale równoległe aktualizacje przez " &
+      "'threadpool' (przestarzały, niebezpieczny z globalnym stanem logowania) zostały " &
+      "wyłączone w v0.3.2 -- aktualizuję sekwencyjnie. Patrz komentarz w orchestrator.nim.")
+  for b in present:
+    discard updateViaBackend(b, cfg)
 
   echo "[zpm] Sprzątam śmieci (autoremove/clean) dla każdego backendu..."
   for b in present:
@@ -615,27 +630,74 @@ proc cmdDoctor*(cfg: ZpmConfig, db: DbConn, fix: bool = false) =
   ##    --fix` nie instaluje ani nie usuwa niczego bez wyraźnej, osobnej
   ##    decyzji operatora, żeby nie robić niespodzianek na systemie
   ##    produkcyjnym.
+  ##
+  ## v0.3.2 -- rozszerzenie `--fix` o wpisy PODWÓJNIE osierocone (nie tylko
+  ## pokwitowania i zpm.lock jak w v0.2): rząd w bazie SQLite dla pakietu
+  ## `own`, dla którego JEDNOCZEŚNIE (a) nie ma pokwitowania instalacji NA
+  ## DYSKU i (b) nie ma już wpisu w own-repository.json -- czyli tool
+  ## zniknął ze WSZYSTKICH źródeł prawdy, nie tylko z jednego. To jest
+  ## bezpieczne do automatycznego usunięcia z bazy (to tylko księgowość
+  ## zpm, ŻADNE pliki na dysku nie są ruszane), bo NIE MA już żadnego
+  ## "poprawnego" stanu, do którego dałoby się cokolwiek "przywrócić" --
+  ## w przeciwieństwie do pojedynczo osieroconych wpisów (np. tylko brak
+  ## pokwitowania, ale tool WCIĄŻ jest w own-repository.json), gdzie
+  ## sensowną naprawą może być REINSTALACJA, nie usunięcie z bazy -- to
+  ## wymaga decyzji operatora i pozostaje tylko sugestią.
+  ## Ta sama zasada "podwójnego osierocenia" obejmuje status='failed':
+  ## jeśli ostatnia (nieudana) instalacja dotyczyła toola, którego W OGÓLE
+  ## już nie ma w own-repository.json, nie ma czego "napraw: zpm remove ;
+  ## zpm install" -- bezpiecznie usuwamy samą księgowość 'failed'.
+  ## Backendy hosta (apt/dnf/...) CELOWO nie dostają analogicznego
+  ## auto-fixa: nie mają drugiego, niezależnego źródła prawdy analogicznego
+  ## do own-repository.json, więc "usunięty z systemu" jest z definicji
+  ## niejednoznaczne (mogło być zamierzone ALBO błędem) i zostaje decyzją
+  ## człowieka.
   var problems = 0
   var fixed = 0
+  let repo = loadOwnRepo(cfg)
 
+  echo &"[zpm doctor] Schemat bazy: v{db.getSchemaVersion()} (ten zpm zna do v{SchemaVersion}) -- migracje stosowane " &
+    "automatycznie przy każdym otwarciu bazy, patrz database.nim."
   echo "[zpm doctor] Sprawdzam bazę zpm vs stan faktyczny..."
   for p in db.listInstalled(includeFailed = true):
     if p.status == "failed":
+      let doubleOrphanFailed = p.backend == bkOwn and repo.findTool(p.name).name.len == 0
+      if doubleOrphanFailed and fix:
+        db.recordRemoval(p.name, p.backend)
+        echo &"  ↺ [--fix] Usunięto wpis 'failed' dla '{p.name}' [own] -- narzędzie nie istnieje już " &
+          "w own-repository.json, więc nie ma do czego wracać ani co reinstalować."
+        inc fixed
+        continue
       echo &"  ✘ {p.name} [{p.backend}] ma status 'failed' w bazie -- ostatnia instalacja się nie powiodła."
-      echo &"      napraw: zpm remove {p.name} ; zpm install {p.name}"
+      if doubleOrphanFailed:
+        echo "      napraw: zpm doctor --fix   (narzędzie zniknęło też z own-repository.json -- nic do reinstalacji)"
+      else:
+        echo &"      napraw: zpm remove {p.name} ; zpm install {p.name}"
       inc problems
       continue
     case p.backend
     of bkOwn:
       if not isOwnInstalled(cfg, p.name, "/"):
+        let doubleOrphan = repo.findTool(p.name).name.len == 0
+        if doubleOrphan and fix:
+          db.recordRemoval(p.name, p.backend)
+          echo &"  ↺ [--fix] Usunięto wpis bazy dla '{p.name}' [own] -- brak pokwitowania NA DYSKU " &
+            "i brak wpisu w own-repository.json jednocześnie (podwójne osierocenie, bezpieczne do usunięcia)."
+          inc fixed
+          continue
         echo &"  ✘ {p.name} [own] jest w bazie zpm, ale brak pokwitowania instalacji ({cfg.ownStateDir}) -- rozjazd."
-        echo &"      napraw: zpm own install {p.name} --force"
+        if doubleOrphan:
+          echo &"      napraw: zpm doctor --fix   (narzędzie zniknęło też z own-repository.json -- nic do reinstalacji)"
+        else:
+          echo &"      napraw: zpm own install {p.name} --force"
         inc problems
     of bkZenitNat:
       let (found, _) = loadNativeReceipt(cfg, p.name, "/")
       if not found:
         echo &"  ✘ {p.name} [zenit-native] jest w bazie zpm, ale brak pokwitowania instalacji ({cfg.nativeStateDir}) -- rozjazd."
         echo &"      napraw: zpm install {p.name} -> zenit"
+        echo "      (bez auto-fixa: backend zenit-native nie ma drugiego, niezależnego rejestru " &
+          "analogicznego do own-repository.json, więc zpm nie może samo stwierdzić, że to bezpieczne)"
         inc problems
     else:
       let (known, installed) = backendIsInstalled(p.backend, p.name)
@@ -646,7 +708,6 @@ proc cmdDoctor*(cfg: ZpmConfig, db: DbConn, fix: bool = false) =
         inc problems
 
   echo "[zpm doctor] Sprawdzam pokwitowania 'own' bez odpowiadającego wpisu w own-repository.json (osierocone)..."
-  let repo = loadOwnRepo(cfg)
   for r in allOwnReceipts(cfg):
     if repo.findTool(r.name).name.len == 0:
       if fix:
