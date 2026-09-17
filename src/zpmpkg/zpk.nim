@@ -1,9 +1,11 @@
-import std/[json, os, osproc, strutils, strformat, times, sequtils, algorithm, sets]
+import std/[json, os, strutils, strformat, times, sequtils, algorithm, sets]
 import ./types
 import ./lockfile
 import ./netutil
 import ./logging
 import ./signing
+import ./archive
+import ./zsha256
 
 ## Natywny format pakietów Zenit Linux -- `.zpk` (`bkZenitNat` w types.nim).
 ##
@@ -53,18 +55,16 @@ proc packageFileName*(m: ZpkManifest): string =
   &"{m.name}-{m.version}-{m.arch}.zpk"
 
 proc sha256sumOf(path: string): string =
-  let sha = execProcess("sha256sum", args = @[path], options = {poUsePath})
-  if sha.len == 0: return ""
-  sha.split(' ')[0].strip()
+  ## v0.5 -- CZYSTY NIM (`zsha256.nim`), zero procesów potomnych. Wcześniej
+  ## wołało `sha256sum` (musiało być w PATH; nie istnieje domyślnie na
+  ## macOS/minimalnych obrazach). Patrz `zsha256.nim` po pełne uzasadnienie
+  ## -- identyczny mechanizm jak w `zpk` (osobne repo), testowany wektorami
+  ## NIST, więc obie strony (budowanie w `zpk`, weryfikacja/instalacja tu)
+  ## liczą sumy identycznie.
+  zsha256.sha256HexOfFile(path)
 
 proc sha256sumOfString(content: string): string =
-  ## sha256 dowolnego tekstu -- zapisuje do pliku tymczasowego i
-  ## przepuszcza przez `sha256sumOf` (jeden mechanizm liczenia sum w
-  ## całym zpm, zamiast osobnej implementacji sha256 w czystym Nim).
-  let tmp = getTempDir() / &"zpm-strdigest-{$epochTime().int}-{getCurrentProcessId()}.tmp"
-  writeFile(tmp, content)
-  defer: removeFile(tmp)
-  sha256sumOf(tmp)
+  zsha256.sha256Hex(content)
 
 proc contentDigestInput(files: seq[ZpkFileEntry]): string =
   ## Kanoniczna reprezentacja "zawartości pakietu" (patrz identyczna
@@ -82,18 +82,22 @@ proc contentDigestOf(files: seq[ZpkFileEntry]): string =
   sha256sumOfString(contentDigestInput(files))
 
 proc extractManifestFromArchive*(zpkPath: string): tuple[ok: bool, manifest: ZpkManifest, err: string] =
-  ## Wyciąga `manifest.json` Z ŚRODKA archiwum `.zpk` (v0.4 -- manifest już
-  ## nie leży obok w osobnym `<plik>.zpk.json`, patrz `zpk build` w osobnym
-  ## repo `zpk`). Używane przez `zpm verify` i przez `installZpk` PRZED
-  ## rozpakowaniem reszty.
+  ## Wyciąga `manifest.json` Z ŚRODKA archiwum `.zpk`. v0.5 -- archiwum
+  ## jest teraz w natywnym formacie ZPKA (patrz `archive.nim`), NIE tar --
+  ## odczyt idzie przez `archive.extractMember` (stopka + TOC, dekompresja
+  ## TYLKO tego jednego człona, zero procesów potomnych). Używane przez
+  ## `zpm verify` i przez `installZpk` PRZED rozpakowaniem reszty.
   if not fileExists(zpkPath):
     return (false, ZpkManifest(), &"nie znaleziono {zpkPath}")
-  let (output, code) = execCmdEx(&"tar -xOf {quoteShell(zpkPath)} {quoteShell(ManifestFileName)}")
-  if code != 0 or output.strip().len == 0:
-    return (false, ZpkManifest(), &"nie udało się odczytać '{ManifestFileName}' z wnętrza {zpkPath} " &
-      &"(kod {code}) -- czy to na pewno poprawne archiwum .zpk?")
+  if not archive.isZpkaFile(zpkPath):
+    return (false, ZpkManifest(), &"{zpkPath} nie jest archiwum w formacie ZPKA v2 -- to prawdopodobnie " &
+      "starszy pakiet .zpk budowany tar-em przez zpk < 0.5; przebuduj go bieżącym `zpk build` i " &
+      "opublikuj ponownie.")
+  let (ok, content, err) = archive.extractMember(zpkPath, ManifestFileName)
+  if not ok:
+    return (false, ZpkManifest(), &"nie udało się odczytać '{ManifestFileName}' z wnętrza {zpkPath}: {err}")
   try:
-    (true, manifestFromJson(parseJson(output)), "")
+    (true, manifestFromJson(parseJson(content)), "")
   except CatchableError as e:
     (false, ZpkManifest(), &"'{ManifestFileName}' wewnątrz {zpkPath} nie jest poprawnym JSON-em: {e.msg}")
 
@@ -110,21 +114,16 @@ proc listArchiveMembers*(zpkPath: string): tuple[ok: bool, members: seq[string],
   ## `zpm verify` zwracało "zweryfikowany pomyślnie", a `zpm install`
   ## faktycznie zapisywało przemycony plik na dysku.
   ##
-  ## Ta funkcja listuje WSZYSTKICH członków archiwum (bez rozpakowywania
-  ## -- `tar -tf`), normalizując prefiks "./" i pomijając wpisy katalogów
-  ## (kończące się na "/") -- do porównania z `manifest.files` przez
-  ## `checkArchiveMembersMatchManifest` niżej.
-  let (output, code) = execCmdEx(&"tar -tf {quoteShell(zpkPath)}")
-  if code != 0:
-    return (false, @[], &"nie udało się wylistować zawartości {zpkPath} (kod {code})")
-  var members: seq[string] = @[]
-  for rawLine in output.splitLines():
-    var m = rawLine.strip()
-    if m.len == 0: continue
-    if m == "." or m == "./": continue
-    if m.startsWith("./"): m = m[2 .. ^1]
-    if m.endsWith("/"): continue  # wpis katalogu, nie plik -- pomijamy
-    members.add m
+  ## v0.5 -- listowanie idzie teraz przez `archive.listMembers` (czyta
+  ## TYLKO stopkę+TOC formatu ZPKA, nie całe archiwum), zamiast `tar -tf`
+  ## jako proces potomny. Ścieżki w TOC są już znormalizowane przy
+  ## zapisie (patrz `archive.writeArchive` -- sortowane, bez "./"/wiodącego
+  ## "/"), więc nie ma tu już potrzeby ręcznej normalizacji linii tekstu.
+  if not archive.isZpkaFile(zpkPath):
+    return (false, @[], &"{zpkPath} nie jest archiwum w formacie ZPKA v2 -- przebuduj bieżącym `zpk build`.")
+  let (ok, members, err) = archive.listMembers(zpkPath)
+  if not ok:
+    return (false, @[], &"nie udało się wylistować zawartości {zpkPath}: {err}")
   (true, members, "")
 
 proc checkArchiveMembersMatchManifest*(zpkPath: string, manifest: ZpkManifest): tuple[ok: bool, messages: seq[string]] =
@@ -196,28 +195,38 @@ proc verifyZpkArchive*(zpkPath: string, publicKeyPath: string = ""): tuple[ok: b
   if not membersOk:
     return (false, manifest, memberMessages)
 
-  let extractDir = getTempDir() / &"zpm-verify-{$epochTime().int}-{getCurrentProcessId()}"
-  createDir(extractDir)
-  defer: removeDir(extractDir)
-  let extractCode = execCmd(&"tar -C \"{extractDir}\" -xf \"{zpkPath}\"")
-  if extractCode != 0:
-    return (false, manifest, @[&"nie udało się rozpakować {zpkPath} do weryfikacji (kod {extractCode})"])
+  # v0.5 -- BEZ rozpakowywania do katalogu tymczasowego i BEZ `tar`:
+  # `archive.readIndex` czyta TOC (ścieżka+sha256+offsety) formatu ZPKA,
+  # a `archive.extractEntry` dekompresuje i weryfikuje sumę KAŻDEGO pliku
+  # bezpośrednio z archiwum, po jednym -- taniej i bez zapisywania
+  # tymczasowej kopii całej zawartości pakietu na dysk.
+  var archiveIdx: archive.ArchiveIndex
+  try:
+    archiveIdx = archive.readIndex(zpkPath)
+  except archive.ArchiveError as e:
+    return (false, manifest, @[&"nie udało się odczytać TOC {zpkPath}: {e.msg}"])
 
   var recomputed: seq[ZpkFileEntry] = @[]
   var mismatch = false
   for entry in manifest.files:
-    let full = extractDir / entry.path
-    if not fileExists(full):
+    let idx = archive.findEntry(archiveIdx, entry.path)
+    if idx < 0:
       ok = false
       mismatch = true
       messages.add &"BRAK pliku zadeklarowanego w manifeście: {entry.path}"
       continue
-    let actual = sha256sumOf(full)
-    recomputed.add ZpkFileEntry(path: entry.path, sha256: actual)
-    if actual != entry.sha256:
+    try:
+      discard archive.extractEntry(archiveIdx, archiveIdx.entries[idx], verifyChecksum = true)
+      let actual = archive.sha256HexOf(archiveIdx.entries[idx].sha256)
+      recomputed.add ZpkFileEntry(path: entry.path, sha256: actual)
+      if actual != entry.sha256:
+        ok = false
+        mismatch = true
+        messages.add &"NIEZGODNOŚĆ sha256 pliku '{entry.path}': manifest={entry.sha256} obliczono={actual}"
+    except archive.ArchiveError as e:
       ok = false
       mismatch = true
-      messages.add &"NIEZGODNOŚĆ sha256 pliku '{entry.path}': manifest={entry.sha256} obliczono={actual}"
+      messages.add &"USZKODZONE dane pliku '{entry.path}' w archiwum: {e.msg}"
 
   if not mismatch:
     if manifest.sha256.len == 0:
@@ -428,14 +437,16 @@ proc installZpk*(zpkPath, rootPath: string, cfg: ZpmConfig, manifest: ZpkManifes
   if files.len == 0:
     stderr.writeLine(&"[zpm:native] ✘ {zpkPath}: manifest nie deklaruje ŻADNYCH plików ładunku.")
     return 1
-  var args = @["-C", root, "-xf", zpkPath, "--"]
-  for f in files: args.add f.path
-  let process = startProcess("tar", args = args, options = {poUsePath, poParentStreams})
-  let code = process.waitForExit()
-  process.close()
-  if code != 0:
-    stderr.writeLine(&"[zpm:native] ✘ Rozpakowanie {zpkPath} do {root} nie powiodło się (kod {code}).")
-    return code
+  # v0.5 -- rozpakowanie idzie przez `archive.extractSelected` (format
+  # ZPKA): dokładnie ta sama allowlista co poprzednio (tylko ścieżki z
+  # `manifest.files`), ale bez odpalania `tar` jako proces potomny --
+  # `archive.nim` sam odmawia dowolnej ścieżki spoza jawnie podanej listy.
+  var memberPaths: seq[string] = @[]
+  for f in files: memberPaths.add f.path
+  let (extractOk, extractErr) = archive.extractSelected(zpkPath, root, memberPaths)
+  if not extractOk:
+    stderr.writeLine(&"[zpm:native] ✘ Rozpakowanie {zpkPath} do {root} nie powiodło się: {extractErr}")
+    return 1
   saveNativeReceipt(cfg, ZpkInstallReceipt(
     name: manifest.name, version: manifest.version, rootPath: root,
     files: files, installedAt: nowIso8601()
