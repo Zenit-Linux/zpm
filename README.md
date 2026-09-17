@@ -327,6 +327,57 @@ wcześniej — weryfikowana jest tylko integralność (sha256), a obecność
 podpisu jest tylko odnotowywana ostrzeżeniem. Patrz też `zpk`'s
 `ZPK_SIGN_KEY`/`zpk build --sign-key=` do podpisywania.
 
+#### v0.5 — format ZPKA: koniec zależności od `tar`
+
+`zpm` NIE buduje `.zpk` (to wyłącznie `zpk build`), ale odczytuje,
+weryfikuje i instaluje je — od v0.5 robi to **bez odpalania ŻADNEGO
+procesu potomnego** (`tar`, `sha256sum`, `shasum`). Cały mechanizm
+odczytu archiwum jest w 100% czystym Nim, wkompilowany w binarkę `zpm`
+(`src/zpmpkg/archive.nim` + `zlz.nim` + `zsha256.nim`) — dokładnie ten
+sam kod (bit-w-bit ten sam format), co po stronie `zpk`, więc pakiet
+zbudowany jedną binarką jest gwarantowanie czytelny drugą.
+
+Poprzednio `zpm` (tak jak `zpk`) opierało się na `tar -xOf`/`tar -tf`/
+`tar -xf` do odczytu manifestu, listowania członków i selektywnej,
+allowlistowej instalacji (`installZpk` rozpakowuje WYŁĄCZNIE pliki
+wymienione w `manifest.files` — patrz komentarz o naprawionej luce
+bezpieczeństwa w `zpmpkg/zpk.nim`, `checkArchiveMembersMatchManifest`).
+Ta sama allowlista działa teraz przez `archive.extractSelected`, czytając
+bezpośrednio z binarnego spisu treści (TOC) archiwum ZPKA — bez zmiany
+modelu bezpieczeństwa, tylko bez zależności od `tar` w PATH.
+
+**Zmiana łamiąca format:** `.zpk` zbudowane przez `zpk < 0.5` (surowy
+tar, patrz README `zpk`) NIE są czytelne przez `zpm >= 0.5` — `zpm
+verify`/`zpm install` zwracają jasny komunikat proszący o przebudowanie
+pakietu bieżącym `zpk build`, zamiast mylącego błędu. Pełny opis formatu
+ZPKA (i uzasadnienie zmiany) — patrz README repo
+[`zpk`](https://github.com/Zenit-Linux/zpk), sekcja "Format `.zpk` --
+ZPKA v2".
+
+#### v0.6 — natywny Ed25519, delty, streaming, bez zmiany API
+
+- **Weryfikacja podpisu bez `openssl`:** `zpm verify`/`zpm install`
+  rozpoznają klucze publiczne natywnego formatu (`-----BEGIN ZPK NATIVE
+  ED25519 PUBLIC KEY-----`, wygenerowane przez `zpk genkey`) i
+  weryfikują je w 100% w Nim (`ed25519.nim`) — zero `openssl` na tej
+  ścieżce. Klucze PEM (RSA/EC/Ed25519-openssl) nadal działają jak
+  wcześniej, przez `openssl pkeyutl`/`dgst`, automatycznie wykryte po
+  treści pliku klucza.
+- **`zpm apply-delta <stare.zpk> <delta.zpkd> <nowe.zpk>`** — odtwarza
+  pełne archiwum z pliku delty (zbudowanego przez `zpk delta` w repo
+  `zpk`) + starej wersji pakietu, bez pobierania/kompresowania na nowo
+  plików, które się nie zmieniły. Wynik jest bajt-w-bajt identyczny z
+  pobraniem pełnego nowego `.zpk`.
+- **Instalacja dużych plików strumieniowo** — `installZpk`/
+  `extractSelected` piszą zdekompresowaną zawartość wpisów ZLZ2
+  (pliki > 4 MiB przy budowaniu) blok po bloku wprost do pliku
+  docelowego, z bieżąco liczoną sumą sha256, zamiast trzymać całą
+  rozpakowaną zawartość w pamięci przed zapisem.
+
+Zero zmian w publicznym zachowaniu `zpm install`/`zpm verify` z
+perspektywy użytkownika — to rozszerzenia tego samego formatu i tych
+samych komend, nie nowy tryb do włączenia ręcznie.
+
 ```hcl
 native {
   repo_index_url    = "https://raw.githubusercontent.com/Zenit-Linux/zenit-repo/main/index.json"
