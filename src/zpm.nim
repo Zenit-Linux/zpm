@@ -5,6 +5,7 @@ import ./zpmpkg/database
 import ./zpmpkg/ownrepo
 import ./zpmpkg/logging
 import ./zpmpkg/filelock
+import ./zpmpkg/archive
 
 when defined(atomic):
   import ./zpmpkg/atomic
@@ -14,7 +15,7 @@ else:
   import ./zpmpkg/zpk
   import ./zpmpkg/securityselftest
 
-const ZpmVersion = "0.3.2"
+const ZpmVersion = "0.6.0"
 
 proc splitOwnNameVersion(spec: string): tuple[name, version: string] =
   ## v0.5 -- `zpm own install <nazwa>[@<wersja>]`: "@" oddziela DOKŁADNĄ
@@ -97,6 +98,11 @@ proc printHelp() =
     echo "                                   Sprawdza integralność (sha256 zawartości, per-plik i"
     echo "                                   zagregowaną) i, jeśli podano --pubkey, autentyczność"
     echo "                                   (podpis) archiwum .zpk -- manifest wewnątrz archiwum"
+    echo "  zpm apply-delta <stare.zpk> <delta.zpkd> <nowe.zpk>"
+    echo "                                   Odtwarza pełne archiwum .zpk z pliku delty (zbudowanego"
+    echo "                                   przez `zpk delta` w repo zpk) + starej wersji pakietu --"
+    echo "                                   pliki niezmienione między wersjami kopiowane bez ponownego"
+    echo "                                   pobierania/kompresowania"
     echo "  zpm install <plik.zpk>            (v0.4) instaluje BEZPOŚREDNIO z lokalnego pliku .zpk,"
     echo "                                   z pełną weryfikacją integralności/podpisu przed instalacją"
     echo "  zpm init                          Inicjalizuje bazę hosta (patrz --trust-keys)"
@@ -314,6 +320,25 @@ else:
       else:
         stderr.writeLine(&"[zpm verify] ✘ weryfikacja {positional[1]} nie powiodła się.")
         quit(1)
+      return
+
+    # `zpm apply-delta <stare.zpk> <delta.zpkd> <nowe.zpk>` -- odtwarza
+    # pełne archiwum ZPKA z delty zbudowanej przez `zpk delta` (patrz
+    # `zpkpkg/archive.nim`/`archive.buildDelta` w repo `zpk`) -- pliki
+    # niezmienione między wersjami są kopiowane bezpośrednio ze starego
+    # archiwum (bez ponownego pobierania/kompresowania), co jest sensem
+    # istnienia delt przy `zpm update` na łączach o ograniczonej
+    # przepustowości. Odtworzone archiwum przechodzi normalnie przez
+    # `zpm verify`/`zpm install` jak każde inne .zpk.
+    if positional[0] == "apply-delta":
+      if positional.len < 4:
+        echo "[zpm apply-delta] Użycie: zpm apply-delta <stare.zpk> <delta.zpkd> <nowe.zpk>"
+        quit(1)
+      let (ok, err) = archive.applyDelta(positional[1], positional[2], positional[3])
+      if not ok:
+        stderr.writeLine(&"[zpm apply-delta] ✘ {err}")
+        quit(1)
+      echo &"[zpm apply-delta] ✔ {positional[3]} odtworzone z {positional[1]} + {positional[2]}"
       return
 
     # `zpm doctor` -- diagnostyka rozjazdu baza/pokwitowania vs stan faktyczny.
