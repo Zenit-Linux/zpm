@@ -114,6 +114,34 @@ proc runPrivileged(cmd: string): int =
   let prefix = if runningAsRoot() or findExe("sudo").len == 0: "" else: "sudo "
   execCmd(prefix & cmd)
 
+proc ensureChrootResolvConf(rootPath: string) =
+  ## NAPRAWIONE: świeżo wyeksportowany obraz dystrybucji
+  ## (installNativeDistroPackage) ma WŁASNY /etc/resolv.conf zapieczony w
+  ## obrazie (pusty/placeholder -- prawdziwe wskazanie na resolver
+  ## kontenery dostają DYNAMICZNIE od silnika w runtime, czego statyczny
+  ## `podman export` w ogóle nie przenosi). `chroot`, w odróżnieniu od
+  ## kontenera, NIE dostaje żadnej sieciowej konfiguracji automatycznie --
+  ## dzieli stos sieciowy hosta 1:1, ale DNS w środku chroota nadal patrzy
+  ## na WŁASNY /etc/resolv.conf chroota. Bez tego każde polecenie
+  ## potrzebujące DNS (apt-get update, cargo install, pip install...)
+  ## wewnątrz chroota kończy się "Temporary failure resolving ...", co
+  ## potem wygląda jak "pakiet nie istnieje" dla KAŻDEGO pakietu na apt/
+  ## dnf/pacman/zypper na raz (to jeden wspólny root cause, nie osobny
+  ## błąd per pakiet).
+  ##
+  ## Kopiujemy (nie bind-mountujemy -- nic nie zostaje do odmontowania,
+  ## nawet jeśli build zostanie przerwany w trakcie) resolv.conf hosta do
+  ## chroota przed KAŻDYM runInChroot -- tanie, idempotentne.
+  ## `copyFile` podąża za symlinkiem (typowe na hostach z systemd-resolved,
+  ## gdzie /etc/resolv.conf to symlink do /run/systemd/resolve/...) i
+  ## kopiuje REALNĄ treść, nie tworzy zwisającego symlinka w chroocie.
+  try:
+    createDir(rootPath / "etc")
+    if fileExists("/etc/resolv.conf"):
+      copyFile("/etc/resolv.conf", rootPath / "etc" / "resolv.conf")
+  except CatchableError as e:
+    log(&"[zpm --building] ostrzeżenie: nie udało się skopiować /etc/resolv.conf do chroota: {e.msg}")
+
 proc runInChroot(rootPath, cmd: string): int =
   ## Uruchamia `cmd` WEWNĄTRZ `rootPath` przez `chroot` -- używane dla
   ## menedżerów, które (w przeciwieństwie do apt/dnf/pacman/zypper) NIE
@@ -136,6 +164,7 @@ proc runInChroot(rootPath, cmd: string): int =
   if findExe("chroot").len == 0:
     log("[zpm --building] ✘ brak polecenia 'chroot' w PATH -- wymagane dla tego backendu w trybie budowania")
     return 1
+  ensureChrootResolvConf(rootPath)
   runPrivileged(&"chroot {quoteShell(rootPath)} /bin/sh -c {quoteShell(cmd)}")
 
 proc hasWorkingPkgMgr(rootPath, backend: string): bool =
