@@ -4,6 +4,8 @@ import ./config
 import ./ownrepo
 import ./trustedkeys
 import ./logging
+import ./containerengine
+import ./crossdistro
 
 type
   BuildTarget* = object
@@ -122,6 +124,12 @@ proc runInChroot(rootPath, cmd: string): int =
   ## wcześniejszy pakiet z backendu `apt` w TEJ SAMEJ liście modułu) --
   ## jeśli nie, `chroot`/powłoka i tak zwrócą czytelny błąd "not found"
   ## zamiast mylącego "Nieznany backend budowania".
+  ##
+  ## v0.4: TERAZ używane też przez apt/dnf/pacman/zypper (patrz
+  ## installNativeDistroPackage) -- po jednorazowym bootstrapie rootPath
+  ## z obrazu bazowej dystrybucji, rootPath ma WŁASNY, działający
+  ## menedżer pakietów w środku, więc każdy kolejny pakiet z tego samego
+  ## backendu leci przez dokładnie tę samą ścieżkę co flatpak/cargo/itd.
   if not dirExists(rootPath):
     log(&"[zpm --building] ✘ katalog docelowy '{rootPath}' nie istnieje -- nie mogę chrootować")
     return 1
@@ -130,20 +138,96 @@ proc runInChroot(rootPath, cmd: string): int =
     return 1
   runPrivileged(&"chroot {quoteShell(rootPath)} /bin/sh -c {quoteShell(cmd)}")
 
+proc hasWorkingPkgMgr(rootPath, backend: string): bool =
+  ## Czy `rootPath` ma już WŁASNY, działający menedżer pakietów danego
+  ## backendu w środku (czyli czy bootstrap z obrazu bazowego już się
+  ## odbył w tym przebiegu) -- sprawdzamy istnienie realnej bazy/binarki
+  ## menedżera, nie samego katalogu (pusty szkielet z runBuildingInit nie
+  ## ma żadnej z tych ścieżek).
+  case backend
+  of "apt": fileExists(rootPath / "usr" / "bin" / "dpkg")
+  of "dnf": fileExists(rootPath / "usr" / "bin" / "rpm")
+  of "pacman": fileExists(rootPath / "usr" / "bin" / "pacman")
+  of "zypper": fileExists(rootPath / "usr" / "bin" / "rpm")
+  else: false
+
+proc installNativeDistroPackage(cfg: ZpmConfig, backend, pkg, rootPath: string): int =
+  ## NAPRAWIONE (v0.4): poprzednio ta gałąź wołała bezpośrednio
+  ## `apt install -y --root=<rootPath> <pkg>` (analogicznie
+  ## `dnf ... --installroot=<rootPath>`, `pacman ... --root <rootPath>`,
+  ## `zypper --root <rootPath> ...`). Dla apt to było BEZWZGLĘDNIE zepsute
+  ## -- prawdziwy apt/apt-get W OGÓLE NIE MA flagi --root
+  ## (`E: Command line option --root=... is not understood`), a nawet z
+  ## poprawną flagą (`apt-get -o Dir=...`) apt/apt-get i tak wymaga JUŻ
+  ## zainicjowanego katalogu docelowego (plik stanu dpkg, sources.list,
+  ## itd.) -- nie da się nim "zbootstrapować" całkiem pustego katalogu, do
+  ## czego służą dedykowane narzędzia jak debootstrap/pacstrap. dnf/pacman/
+  ## zypper mają wprawdzie realne flagi --installroot/--root, ale też
+  ## generalnie zakładają choć częściowo zainicjowany target.
+  ##
+  ## Zamiast integrować osobno debootstrap/pacstrap/dnf --installroot dla
+  ## każdego z czterech menedżerów, reużywamy JUŻ ISTNIEJĄCY w tym repo
+  ## mechanizm izolowanej instalacji przez obraz kontenera -- ten sam,
+  ## którego używa `zpm atomic` i jawny cross-distro
+  ## (`pakiet -> apt -> debian.testing`, patrz crossdistro.nim):
+  ##
+  ##   1. Jeśli `rootPath` NIE MA JESZCZE własnego, działającego menedżera
+  ##      pakietów danego backendu w środku (`hasWorkingPkgMgr` == false)
+  ##      -- wyeksportuj CAŁY obraz domyślnej dystrybucji dla tego
+  ##      backendu (apt->ubuntu, dnf->fedora, pacman->arch,
+  ##      zypper->opensuse; nadpisywalne przez native.distro_images w
+  ##      config.hcl -- patrz `nativeImageFor`) WPROST do `rootPath`. To
+  ##      jest odpowiednik jednorazowego debootstrap/pacstrap: po tym
+  ##      kroku `rootPath` ma kompletny, samodzielny system plików Z
+  ##      WŁASNYM apt/dpkg (czy dnf/pacman/zypper) w środku.
+  ##   2. Jeśli zażądany pakiet to nie literalnie "base" (czyli operator
+  ##      chciał czegoś więcej niż sam bazowy system) -- doinstaluj go
+  ##      normalnie przez `chroot rootPath <menedżer> install <pkg>`
+  ##      (`runInChroot`, który rootPath ma już własny, działający
+  ##      menedżer pakietów po kroku 1).
+  ##   3. Jeśli `rootPath` JUŻ MA działający menedżer pakietów (baza była
+  ##      już zbudowana wcześniej w TYM SAMYM przebiegu, np. dla
+  ##      linux-firmware/systemd/... zaraz po "base") -- pomijamy krok 1 i
+  ##      od razu robimy `chroot rootPath <menedżer> install <pkg>`.
+  if not hasWorkingPkgMgr(rootPath, backend):
+    let engine = detectContainerEngine()
+    if engine.len == 0:
+      log(&"[zpm --building] ✘ {pkg}@{backend}: bootstrap pustego '{rootPath}' wymaga 'podman' albo 'buildah' w PATH")
+      return 1
+    let image = nativeImageFor(cfg, backend)
+    if image.len == 0:
+      log(&"[zpm --building] ✘ {pkg}@{backend}: brak domyślnego obrazu bazowego dla backendu '{backend}' -- " &
+        "dodaj mapowanie w native.distro_images w config.hcl")
+      return 1
+    log(&"[zpm --building] -> bootstrap '{rootPath}' z obrazu {image} (silnik: {engine}) [backend: {backend}]...")
+    if not exportImageToLower(engine, image, rootPath):
+      log(&"[zpm --building] ✘ {pkg}@{backend}: nie udało się pobrać/eksportować obrazu bazowego '{image}' do {rootPath}")
+      return 1
+    log(&"[zpm --building] ✔ bootstrap '{rootPath}' zakończony (obraz: {image})")
+    if pkg == "base":
+      return 0
+  let installCmd = installCmdFor(backend, pkg)
+  if installCmd.len == 0:
+    log(&"[zpm --building] ✘ {pkg}@{backend}: brak zdefiniowanej komendy instalacji dla backendu '{backend}'")
+    return 1
+  runInChroot(rootPath, installCmd)
+
+proc removeCmdFor(backend, pkg: string): string =
+  case backend
+  of "apt": &"apt-get remove -y {pkg}"
+  of "dnf": &"dnf remove -y {pkg}"
+  of "pacman": &"pacman -R --noconfirm {pkg}"
+  of "zypper": &"zypper --non-interactive remove {pkg}"
+  else: ""
+
 proc installIntoRootWithBackend(rootPath: string, spec: PackageSpec, cfg: ZpmConfig): int =
   ## Deleguje instalację "per-pakiet" do menedżera bazowego, ale z flagą
   ## roota/sysroota, tak żeby nic nie trafiło na system, na którym
   ## budujemy obraz.
   let pkg = spec.name
   case spec.backend
-  of "apt":
-    result = runPrivileged(&"apt install -y --root={rootPath} {pkg}")
-  of "dnf":
-    result = runPrivileged(&"dnf install -y --installroot={rootPath} {pkg}")
-  of "pacman":
-    result = runPrivileged(&"pacman -S --noconfirm --root {rootPath} {pkg}")
-  of "zypper":
-    result = runPrivileged(&"zypper --root {rootPath} install -y {pkg}")
+  of "apt", "dnf", "pacman", "zypper":
+    result = installNativeDistroPackage(cfg, spec.backend, pkg, rootPath)
   of "brew":
     # Linuxbrew do sysroota obrazu: instalujemy do własnego prefiksu
     # osadzonego pod rootPath/opt/homebrew, żeby nie dotykać hosta.
@@ -252,10 +336,14 @@ proc runBuildingRemove*(cfg: ZpmConfig, rootPath, backend: string, rawPackages: 
     let pkgBackend = if spec.backend.len > 0: spec.backend else: effectiveBackend
     log(&"[zpm --root {rootPath}] usuwam {spec.name} (backend: {pkgBackend})")
     case pkgBackend
-    of "apt": discard runPrivileged(&"apt remove -y --root={rootPath} {spec.name}")
-    of "dnf": discard runPrivileged(&"dnf remove -y --installroot={rootPath} {spec.name}")
-    of "pacman": discard runPrivileged(&"pacman -R --noconfirm --root {rootPath} {spec.name}")
-    of "zypper": discard runPrivileged(&"zypper --root {rootPath} remove -y {spec.name}")
+    of "apt", "dnf", "pacman", "zypper":
+      # v0.4: tak samo jak przy instalacji -- rootPath ma już WŁASNY
+      # menedżer pakietów w środku (skoro coś w ogóle było zainstalowane
+      # przez installNativeDistroPackage), więc usuwanie leci przez
+      # dokładnie ten sam `runInChroot`, zamiast nieistniejącej flagi
+      # `--root` na menedżerze hosta.
+      let cmd = removeCmdFor(pkgBackend, spec.name)
+      if cmd.len > 0: discard runInChroot(rootPath, cmd)
     of "flatpak": discard runInChroot(rootPath, &"flatpak uninstall -y {spec.name}")
     of "snap": discard runInChroot(rootPath, &"snap remove {spec.name}")
     of "cargo": discard runInChroot(rootPath, &"cargo uninstall {spec.name}")
