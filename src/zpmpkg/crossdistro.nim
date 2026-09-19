@@ -55,6 +55,25 @@ const knownDistroBackend = {
   "alpine": "apk",
 }.toTable
 
+## v0.4 -- domyślna dystrybucja-obraz dla KAŻDEGO natywnego backendu, gdy
+## package.list NIE podaje jawnego wariantu cross-distro (samo "apt", bez
+## "-> apt -> debian.testing"). Używane przez building.nim do bootstrapu
+## PUSTEGO rootPath (patrz installNativeDistroPackage tam) -- żaden z
+## natywnych menedżerów nie ma poprawnej, samowystarczalnej flagi
+## "zainstaluj do zupełnie pustego katalogu" (apt/apt-get w ogóle nie ma
+## flagi --root; dnf --installroot/pacman --root/zypper --root zakładają
+## już częściowo zainicjowany target), więc zamiast tego eksportujemy
+## CAŁY obraz tej dystrybucji przez ten sam mechanizm co jawny
+## cross-distro (`distroImageFor` -- w tym override przez
+## native.distro_images w config.hcl, gdyby operator chciał np. przypiąć
+## konkretną wersję zamiast ruchomego ":latest").
+const defaultDistroForBackend* = {
+  "apt": "ubuntu",
+  "dnf": "fedora",
+  "pacman": "arch",
+  "zypper": "opensuse",
+}.toTable
+
 proc splitDistroVariant*(variant: string): tuple[distro, suite: string] =
   ## "debian" -> ("debian", ""); "debian.testing" -> ("debian", "testing")
   let idx = variant.find('.')
@@ -71,6 +90,15 @@ proc distroImageFor*(cfg: ZpmConfig, distro, suite: string): string =
     return ""
   let base = knownDistroImages[distro]
   if suite.len > 0: &"{base}:{suite}" else: &"{base}:latest"
+
+proc nativeImageFor*(cfg: ZpmConfig, backend: string): string =
+  ## Patrz komentarz przy `defaultDistroForBackend`. Zwraca "" jeśli
+  ## backend nie ma zmapowanej domyślnej dystrybucji (np. "own"/"cargo"/
+  ## "pip"/... -- te NIE bootstrapują pustego rootPath przez obraz, mają
+  ## własną logikę w building.nim).
+  let distro = defaultDistroForBackend.getOrDefault(backend, "")
+  if distro.len == 0: return ""
+  distroImageFor(cfg, distro, "")
 
 proc crossDistroInstall*(cfg: ZpmConfig, requestedBackend, variant, pkg, rootPath: string): tuple[ok: bool, err: string] =
   let (distro, suite) = splitDistroVariant(variant)
