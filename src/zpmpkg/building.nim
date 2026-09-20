@@ -297,7 +297,14 @@ proc installIntoRootWithBackend(rootPath: string, spec: PackageSpec, cfg: ZpmCon
     createDir(brewPrefix)
     result = execCmd(&"HOMEBREW_PREFIX={brewPrefix} brew install --appdir={brewPrefix} {pkg}")
   of "flatpak":
-    result = runInChroot(rootPath, &"flatpak install -y flathub {pkg}")
+    # NAPRAWIONE: `flatpak install -y flathub {pkg}` zakładało, że remote
+    # "flathub" już istnieje w świeżo zbootstrapowanym rootfs -- nigdy nie
+    # jest dodawany, więc zawsze kończyło się "No remote refs found for
+    # 'flathub'". `--if-not-exists` czyni to idempotentnym (bezpieczne przy
+    # kolejnych pakietach flatpak w tym samym module).
+    result = runInChroot(rootPath,
+      "flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo && " &
+      &"flatpak install -y flathub {pkg}")
   of "snap":
     result = runInChroot(rootPath, &"snap install {pkg}")
   of "cargo":
