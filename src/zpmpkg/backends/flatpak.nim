@@ -28,6 +28,11 @@ proc isInstalled*(appId: string): bool =
   code == 0
 
 proc install*(appId: string): int =
+  ## NAPRAWIONE: tak samo jak w building.nim -- bez `remote-add` najpierw,
+  ## `flatpak install -y flathub {appId}` zawsze kończyło się "No remote
+  ## refs found for 'flathub'" na świeżym systemie. `--if-not-exists`
+  ## czyni to bezpiecznym przy powtórnych wywołaniach.
+  discard runInteractive("flatpak", @["remote-add", "--if-not-exists", "flathub", "https://flathub.org/repo/flathub.flatpakrepo"])
   runInteractive("flatpak", @["install", "-y", "flathub", appId])
 
 proc remove*(appId: string): int =
