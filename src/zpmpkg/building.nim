@@ -142,6 +142,18 @@ proc ensureChrootResolvConf(rootPath: string) =
   except CatchableError as e:
     log(&"[zpm --building] ostrzeżenie: nie udało się skopiować /etc/resolv.conf do chroota: {e.msg}")
 
+proc mountBind(src, dst: string, recursive: bool = false): bool =
+  try:
+    createDir(dst)
+  except CatchableError:
+    return false
+  let flag = if recursive: "--rbind" else: "--bind"
+  execCmd(&"mount {flag} {quoteShell(src)} {quoteShell(dst)}") == 0
+
+proc unmountQuiet(path: string, recursive: bool = false) =
+  let flag = if recursive: "--recursive " else: ""
+  discard execCmd(&"umount {flag}{quoteShell(path)} >/dev/null 2>&1")
+
 proc runInChroot(rootPath, cmd: string): int =
   ## Uruchamia `cmd` WEWNĄTRZ `rootPath` przez `chroot` -- używane dla
   ## menedżerów, które (w przeciwieństwie do apt/dnf/pacman/zypper) NIE
@@ -165,6 +177,27 @@ proc runInChroot(rootPath, cmd: string): int =
     log("[zpm --building] ✘ brak polecenia 'chroot' w PATH -- wymagane dla tego backendu w trybie budowania")
     return 1
   ensureChrootResolvConf(rootPath)
+  # NAPRAWIONE: goły `chroot` (w odróżnieniu od kontenera) nie ma w
+  # środku ŻADNYCH wirtualnych systemów plików (/proc, /sys, /dev) --
+  # bez nich menedżery pakietów (a zwłaszcza postinst-skrypt systemd)
+  # wywalają się na wiele różnych, mylących sposobów, które są w
+  # rzeczywistości JEDNYM brakującym montowaniem: "⚠️ /proc/ is not
+  # mounted", "E: Can not write log (Is /dev/pts mounted?)", "Cannot
+  # open '/etc/machine-id'... Function not implemented". Montujemy
+  # /proc, /sys, /dev (rekurencyjnie -- --rbind na /dev automatycznie
+  # przenosi też /dev/pts, /dev/shm itd., bez potrzeby osobnego
+  # `mount -t devpts`) tuż przed chrootem, i ZAWSZE odmontowujemy w
+  # `defer`, więc odpali się nawet jeśli komenda w środku padnie.
+  let procDst = rootPath / "proc"
+  let sysDst = rootPath / "sys"
+  let devDst = rootPath / "dev"
+  let procOk = mountBind("/proc", procDst)
+  let sysOk = mountBind("/sys", sysDst)
+  let devOk = mountBind("/dev", devDst, recursive = true)
+  defer:
+    if devOk: unmountQuiet(devDst, recursive = true)
+    if sysOk: unmountQuiet(sysDst)
+    if procOk: unmountQuiet(procDst)
   runPrivileged(&"chroot {quoteShell(rootPath)} /bin/sh -c {quoteShell(cmd)}")
 
 proc hasWorkingPkgMgr(rootPath, backend: string): bool =
