@@ -3,6 +3,8 @@ import ./zpmpkg/types
 import ./zpmpkg/config
 import ./zpmpkg/database
 import ./zpmpkg/ownrepo
+import ./zpmpkg/auth
+import ./zpmpkg/versioncache
 import ./zpmpkg/logging
 import ./zpmpkg/filelock
 import ./zpmpkg/archive
@@ -16,18 +18,6 @@ else:
   import ./zpmpkg/securityselftest
 
 const ZpmVersion = "0.6.0"
-
-proc splitOwnNameVersion(spec: string): tuple[name, version: string] =
-  ## v0.5 -- `zpm own install <nazwa>[@<wersja>]`: "@" oddziela DOKŁADNĄ
-  ## żądaną wersję (podmienianą wprost za `{version}` w polu "bin") od
-  ## nazwy narzędzia. Bez "@" (albo z pustą wersją po "@") -- zpm SAM
-  ## ustala najnowszą wersję (patrz `resolveVersionPlaceholder` w
-  ## ownrepo.nim). Bezpieczne wobec "@" nigdzie indziej w `zpm own` nie
-  ## niosącego innego znaczenia (w przeciwieństwie do `zpm install
-  ## pakiet@backend` -- to inna, osobna komenda).
-  let idx = spec.find('@')
-  if idx < 0: return (spec, "")
-  (spec[0 ..< idx], spec[idx+1 .. ^1])
 
 proc printBanner() =
   when defined(atomic):
@@ -214,6 +204,9 @@ else:
     var tagFilter = ""
     var branchOpt = ""
     var logFile = ""
+    var tokenOpt = ""
+    var statusFlag = false
+    var deviceFlag = false
     var positional: seq[string] = @[]
 
     var p = initOptParser(commandLineParams())
@@ -244,6 +237,9 @@ else:
         of "tag": tagFilter = val.strip().toLowerAscii()
         of "branch", "system": branchOpt = val.strip()
         of "log-file": logFile = val  ## v0.3.2 -- patrz logging.nim (kanał NDJSON, niezależny od --json)
+        of "token": tokenOpt = val   ## `zpm login --token=<TOKEN>` -- nieinteraktywnie (skrypty/CI)
+        of "status": statusFlag = true  ## `zpm login --status`
+        of "device": deviceFlag = true  ## `zpm login --device` (OAuth Device Flow)
         else: discard
       of cmdEnd: discard
 
@@ -294,6 +290,57 @@ else:
 
     if positional.len == 0:
       printHelp()
+      return
+
+    # `zpm login [--token=<TOKEN>]` / `zpm login --status` -- zapisuje
+    # (albo pokazuje stan) token GitHub podnoszący limit zapytań API z
+    # 60/h do min. 1000/h (patrz zpmpkg/auth.nim). Czysto lokalna operacja
+    # (plik na dysku + jedno zapytanie walidujące) -- nie wymaga otwierania
+    # bazy pakietów ani rootPath.
+    if positional[0] == "login":
+      if statusFlag:
+        cmdAuthStatus()
+      elif deviceFlag:
+        cmdLoginDevice()
+      else:
+        cmdLogin(tokenOpt)
+      return
+
+    # `zpm logout` -- kasuje zapamiętany token natychmiast, na żądanie.
+    if positional[0] == "logout":
+      cmdLogout()
+      return
+
+    # `zpm cache clear` / `zpm cache status` -- patrz clearAllNetworkCaches
+    # w ownrepo.nim. Czysto lokalna operacja na plikach, nie wymaga sieci
+    # ani otwierania bazy pakietów.
+    if positional[0] == "cache":
+      if positional.len < 2 or positional[1] == "status":
+        let path = cacheFilePath()
+        if fileExists(path):
+          log(&"[zpm cache] TTL cache: {path}")
+        else:
+          log("[zpm cache] TTL cache: brak (pusty)")
+        let centralPath = getCacheDir() / "zpm" / "central-latest-versions-cache.json"
+        log(&"[zpm cache] manifest scentralizowany: " & (if fileExists(centralPath): centralPath else: "brak (pusty)"))
+        let ghDir = getCacheDir() / "zpm" / "gh-release-cache"
+        if dirExists(ghDir):
+          var n = 0
+          for _ in walkFiles(ghDir / "*.json"): inc n
+          log(&"[zpm cache] fallback REST API: {ghDir} ({n} wpis(ów))")
+        else:
+          log("[zpm cache] fallback REST API: brak (pusty)")
+      elif positional[1] == "clear":
+        let removed = clearAllNetworkCaches()
+        if removed.len == 0:
+          log("[zpm cache clear] i tak nic nie było w cache -- nic do wyczyszczenia.")
+        else:
+          log(&"[zpm cache clear] ✔ wyczyszczono {removed.len} plik(ów)/katalog(ów):")
+          for p in removed:
+            log(&"  - {p}")
+      else:
+        stderr.writeLine(&"[zpm cache] nieznana podkomenda '{positional[1]}' (oczekiwano: clear | status)")
+        quit(1)
       return
 
     # `zpm refresh` -- odświeża TYLKO custom/own-repository.json.
