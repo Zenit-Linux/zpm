@@ -1,4 +1,4 @@
-import std/[json, os, osproc, strutils, strformat, algorithm, strtabs, envvars, sets, tables]
+import std/[json, os, osproc, strutils, strformat, algorithm, strtabs, envvars, sets, tables, httpclient]
 import ./types
 import ./deps
 import ./lockfile
@@ -9,6 +9,7 @@ import ./trustedkeys
 import ./logging
 import ./netutil
 import ./containerengine
+import ./versioncache
 
 const DefaultOwnRepoPath* = "/etc/zpm/custom/own-repository.json"
 const DefaultOwnRepoUrl* =
@@ -500,6 +501,20 @@ proc resolveOwnBinUrl*(tool: OwnRepoTool, cfg: ZpmConfig): string =
   log(&"[zpm:own] ⚠ '{tool.name}': brak wariantu 'bin' dla architektury '{want}' -- używam {tool.bin}")
   tool.bin
 
+proc splitOwnNameVersion*(spec: string): tuple[name, version: string] =
+  ## v0.5 -- `zpm own install <nazwa>[@<wersja>]` I (v0.6) package.list w
+  ## zlb (`version = "..."` w bloku `package`, patrz building.nim): "@"
+  ## oddziela DOKŁADNĄ żądaną wersję (podmienianą wprost za `{version}` w
+  ## polu "bin") od nazwy narzędzia. Bez "@" (albo z pustą wersją po "@")
+  ## -- zpm SAM ustala najnowszą wersję (patrz `resolveVersionPlaceholder`
+  ## niżej). Wyeksportowane tutaj (zamiast prywatnie w zpm.nim) właśnie po
+  ## to, żeby ta sama logika obsługiwała OBIE ścieżki: ręczne `zpm own
+  ## install` i automatyczne wywołania z trybu budowania (`zpm --root ...
+  ## install`, wołane przez `zlb build rootfs`).
+  let idx = spec.find('@')
+  if idx < 0: return (spec, "")
+  (spec[0 ..< idx], spec[idx+1 .. ^1])
+
 proc containsVersionPlaceholder*(url: string): bool =
   ## v0.5 -- czy `url` (pole "bin") zawiera placeholder `{version}`,
   ## patrz komentarz w types.nim (`OwnRepoTool`) i `resolveVersionPlaceholder`
@@ -526,15 +541,91 @@ proc parseGithubOwnerRepo*(url: string): tuple[ok: bool, owner, repo: string] =
   if repo.endsWith(".git"): repo = repo[0 ..< repo.len - 4]
   (true, parts[0], repo)
 
-proc fetchLatestGithubRelease*(owner, repo: string, cfg: ZpmConfig): tuple[ok: bool, tag, err: string] =
-  ## Ustala NAJNOWSZĄ wersję (tag) danego repo GitHuba przez oficjalne REST
-  ## API (`GET /repos/{owner}/{repo}/releases/latest`) -- dokładnie to, co
-  ## GitHub uznaje za "Latest release" na stronie repo (najnowszy NIE-
-  ## -prerelease/NIE-draft release). Idzie przez `netutil.safeFetchUrlBody`,
-  ## więc honoruje `security.trusted_hosts`/`max_download_mb`/pinning
-  ## certyfikatu tak samo jak każde inne pobranie zpm.
+const CentralLatestVersionsUrl* =
+  "https://raw.githubusercontent.com/Zenit-Linux/own-repository/main/repo/latest-versions.json"
+  ## v0.6 -- generowane RAZ DZIENNIE przez .github/workflows/
+  ## generate-latest-versions.yml w repo Zenit-Linux/own-repository (patrz
+  ## scripts/generate_latest_versions.py tamże). Zwykły plik statyczny --
+  ## czytany przez raw.githubusercontent.com, zupełnie inny (dużo luźniejszy)
+  ## limit niż api.github.com. Format: {"owner/repo": "vX.Y.Z", ...}.
+
+var centralManifestCache = initTable[string, string]()
+var centralManifestTried = false
+
+proc tryCentralManifest(owner, repo: string, cfg: ZpmConfig): string =
+  ## WARSTWA 1 (zaraz po lokalnym cache TTL, PRZED per-repo redirectem z
+  ## `resolveLatestTagViaRedirect`) -- jedno pobranie tego manifestu (samo
+  ## też cache'owane przez `cachedFetch`/ETag, patrz netutil.nim) rozwiązuje
+  ## OD RAZU wszystkie pakiety "own" potrzebne w jednym buildzie (zpm,
+  ## installer, kernel, zenit-base, ...), zamiast osobnego zapytania/
+  ## przekierowania per pakiet. Pobieramy i parsujemy TYLKO RAZ na cały
+  ## proces zpm (`centralManifestTried`), nawet jeśli manifest nie ma
+  ## szukanego wpisu -- kolejne wywołania po prostu spadają dalej na
+  ## redirect/API bez ponownego dobijania się do tego samego pliku.
+  if not centralManifestTried:
+    centralManifestTried = true
+    let cachePath = getCacheDir() / "zpm" / "central-latest-versions-cache.json"
+    let r = cachedFetch(CentralLatestVersionsUrl, cachePath, cfg, "zpm:own:central-manifest")
+    if r.ok:
+      try:
+        let j = parseJson(r.body)
+        for k, v in j.pairs:
+          centralManifestCache[k] = v.getStr("")
+        logVerbose(&"[zpm:own] scentralizowany manifest wersji wczytany ({centralManifestCache.len} wpisów)")
+      except CatchableError as e:
+        logVerbose(&"[zpm:own] nie udało się sparsować scentralizowanego manifestu wersji: {e.msg}")
+    else:
+      logVerbose(&"[zpm:own] scentralizowany manifest wersji niedostępny ({r.err}) -- pomijam tę warstwę")
+  centralManifestCache.getOrDefault(&"{owner}/{repo}", "")
+
+proc resolveLatestTagViaRedirect(owner, repo: string): tuple[ok: bool, tag, err: string] =
+  ## v0.6 -- WARSTWA 2 (po lokalnym cache TTL): zamiast pytać REST API
+  ## (`api.github.com`, limit 60/h niezalogowane), sprawdzamy dokąd
+  ## przekierowuje PUBLICZNA strona wydań:
+  ##   HEAD https://github.com/{owner}/{repo}/releases/latest
+  ## GitHub odpowiada 302 z `Location` wskazującym na
+  ## `.../releases/tag/vX.Y.Z` -- to zwykła strona WWW frontendu, NIE
+  ## `api.github.com`, więc W OGÓLE nie liczy się do tego limitu (inny,
+  ## dużo luźniejszy limit ruchu front-endowego, dokładnie tak jak
+  ## `releases/latest/download/plik`, którego już używamy w CI). Działa
+  ## tylko dla PUBLICZNYCH repo -- prywatne wymagają zalogowania nawet na
+  ## stronie WWW, więc dla nich (i przy jakimkolwiek innym niepowodzeniu)
+  ## wołający spada na `fetchLatestGithubReleaseViaApi`.
+  try:
+    var client = newHttpClient(timeout = 15_000, maxRedirects = 0)
+    client.headers = newHttpHeaders({"User-Agent": "zpm/0.2"})
+    defer: client.close()
+    let resp = client.request(&"https://github.com/{owner}/{repo}/releases/latest", httpMethod = HttpHead)
+    if resp.code notin {Http301, Http302, Http303, Http307, Http308}:
+      return (false, "", &"redirect resolver: nieoczekiwany kod {resp.code} (spodziewano 30x)")
+    let loc = resp.headers.getOrDefault("Location")
+    if loc.len == 0:
+      return (false, "", "redirect resolver: brak nagłówka Location w odpowiedzi")
+    const marker = "/releases/tag/"
+    let idx = loc.find(marker)
+    if idx < 0:
+      return (false, "", &"redirect resolver: nie rozpoznaję formatu Location: {loc}")
+    var tag = loc[idx + marker.len .. ^1]
+    let qIdx = tag.find('?')
+    if qIdx >= 0: tag = tag[0 ..< qIdx]
+    if tag.len == 0:
+      return (false, "", "redirect resolver: pusty tag po sparsowaniu Location")
+    (true, tag, "")
+  except CatchableError as e:
+    (false, "", &"redirect resolver: {e.msg}")
+
+proc fetchLatestGithubReleaseViaApi(owner, repo: string, cfg: ZpmConfig): tuple[ok: bool, tag, err: string] =
+  ## WARSTWA 3 (ostatnia deska ratunku) -- prawdziwe REST API, ale przez
+  ## `cachedFetch` (netutil.nim): warunkowe zapytanie z `If-None-Match`,
+  ## jeśli mamy zapisany ETag z poprzedniego razu. GitHub NIE liczy `304
+  ## Not Modified` do limitu 60/h, więc nawet ten fallback jest tańszy niż
+  ## "goły" strzał w API -- a jeśli jest ustawiony GITHUB_TOKEN/GH_TOKEN
+  ## albo zalogowano się przez `zpm login`, `cachedFetch` sam dołączy
+  ## `Authorization` (patrz `githubAuthHeaderIfApplicable` w netutil.nim),
+  ## podnosząc limit do min. 1000/h.
   let apiUrl = &"https://api.github.com/repos/{owner}/{repo}/releases/latest"
-  let r = safeFetchUrlBody(apiUrl, cfg, "zpm:own:version")
+  let cachePath = getCacheDir() / "zpm" / "gh-release-cache" / &"{owner}__{repo}.json"
+  let r = cachedFetch(apiUrl, cachePath, cfg, "zpm:own:version")
   if not r.ok:
     return (false, "", &"nie udało się odpytać GitHub API ({apiUrl}): {r.err}")
   try:
@@ -546,6 +637,70 @@ proc fetchLatestGithubRelease*(owner, repo: string, cfg: ZpmConfig): tuple[ok: b
     (true, tag, "")
   except CatchableError as e:
     (false, "", &"nie udało się sparsować odpowiedzi GitHub API dla {owner}/{repo}: {e.msg}")
+
+proc clearAllNetworkCaches*(): seq[string] =
+  ## `zpm cache clear` -- kasuje WSZYSTKIE trzy lokalne cache'e sieciowe
+  ## naraz (patrz zpm.nim, cmdCacheClear):
+  ##   1. TTL cache "najnowszej wersji" (versioncache.nim)
+  ##   2. Cache scentralizowanego manifestu latest-versions.json (+ jego
+  ##      sidecar ETag .meta.json, patrz cachedFetch w netutil.nim)
+  ##   3. Cache fallbacku REST API per-repo (gh-release-cache/, jeden
+  ##      plik + sidecar ETag na repo)
+  ## Zwraca liste FAKTYCZNIE usunietych sciezek (do czytelnego komunikatu),
+  ## nie wywala się jesli czegos i tak juz nie bylo.
+  result = @[]
+  if clearTtlCache():
+    result.add cacheFilePath()
+
+  let centralPath = getCacheDir() / "zpm" / "central-latest-versions-cache.json"
+  for p in [centralPath, centralPath & ".meta.json"]:
+    if fileExists(p):
+      removeFile(p)
+      result.add p
+
+  let ghReleaseDir = getCacheDir() / "zpm" / "gh-release-cache"
+  if dirExists(ghReleaseDir):
+    removeDir(ghReleaseDir)
+    result.add ghReleaseDir & "/"
+
+proc fetchLatestGithubRelease*(owner, repo: string, cfg: ZpmConfig): tuple[ok: bool, tag, err: string] =
+  ## v0.6 -- Ustala NAJNOWSZĄ wersję (tag) danego repo GitHuba w trzech
+  ## warstwach, od najtańszej do najdroższej, wszystkie oszczędzające
+  ## budżet `api.github.com` (60 zapytań/h NIEZALOGOWANE, NA ADRES IP --
+  ## krytyczne przy wielu użytkownikach/buildach na tym samym IP):
+  ##   1. Lokalny cache z TTL (domyślnie 1h, versioncache.nim) -- w oknie
+  ##      ważności ZERO zapytań sieciowych.
+  ##   2. Redirect publicznej strony wydań (`resolveLatestTagViaRedirect`)
+  ##      -- w ogóle nie dotyka `api.github.com`.
+  ##   3. REST API z warunkowym `If-None-Match` + tokenem, jeśli dostępny
+  ##      (`fetchLatestGithubReleaseViaApi`) -- tylko gdy (2) zawiedzie
+  ##      (np. repo prywatne).
+  let ownerRepo = &"{owner}/{repo}"
+  let cached = getFreshCached(ownerRepo)
+  if cached.tag.len > 0:
+    logVerbose(&"[zpm:own] '{ownerRepo}': najnowsza wersja z lokalnego cache ({cached.tag}), bez zapytania sieciowego.")
+    return (true, cached.tag, "")
+
+  let centralTag = tryCentralManifest(owner, repo, cfg)
+  if centralTag.len > 0:
+    log(&"[zpm:own] ✔ Najnowsza wersja '{ownerRepo}': {centralTag} (ze scentralizowanego manifestu -- zero zapytań do api.github.com)")
+    setCached(ownerRepo, centralTag, "")
+    return (true, centralTag, "")
+
+  log(&"[zpm:own] Ustalam najnowszą wersję '{ownerRepo}' (bez api.github.com, jeśli się da) ...")
+  let (redirOk, redirTag, redirErr) = resolveLatestTagViaRedirect(owner, repo)
+  if redirOk:
+    log(&"[zpm:own] ✔ Najnowsza wersja '{ownerRepo}': {redirTag} (przez redirect, bez zużycia limitu API)")
+    setCached(ownerRepo, redirTag, "")
+    return (true, redirTag, "")
+  logVerbose(&"[zpm:own] redirect resolver nie zadziałał dla '{ownerRepo}' ({redirErr}) -- fallback na REST API")
+
+  let (apiOk, apiTag, apiErr) = fetchLatestGithubReleaseViaApi(owner, repo, cfg)
+  if not apiOk:
+    return (false, "", apiErr)
+  log(&"[zpm:own] ✔ Najnowsza wersja '{ownerRepo}': {apiTag} (przez REST API)")
+  setCached(ownerRepo, apiTag, "")
+  (true, apiTag, "")
 
 proc resolveVersionPlaceholder*(url: string, cfg: ZpmConfig,
                                  requestedVersion: string = ""): tuple[ok: bool, url, version, err: string] =
