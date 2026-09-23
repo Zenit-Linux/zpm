@@ -120,6 +120,58 @@ manifest wieloarchitekturowy przy publikacji (patrz \fBzpk\fR(1),
 .B zpm init \fR[\fB\-\-trust\-keys=\fIplik\fR]
 Inicjalizuje bazę hosta. v0.2: \fB\-\-trust\-keys\fR REALNIE importuje
 i persystuje zestaw zaufanych fingerprintów/kluczy GPG.
+.TP
+.B zpm login \fR[\fB\-\-token=\fITOKEN\fR] \fR[\fB\-\-device\fR] \fR[\fB\-\-status\fR]
+(v0.6) Zapisuje token GitHub podnoszący limit zapytań do
+\fBapi.github.com\fR z 60/h (niezalogowane, na adres IP, współdzielone
+przez wszystkich w tej samej sieci) do min. 1000/h (per token). Bez
+żadnej flagi pyta interaktywnie o token (input ukryty, jak przy haśle).
+\fB\-\-token=\fR wkleja token nieinteraktywnie (skrypty/CI).
+\fB\-\-device\fR (v0.7) loguje przez przeglądarkę (OAuth Device Flow, jak
+\fBgh auth login\fR) zamiast ręcznego zakładania/wklejania tokenu --
+wymaga zarejestrowanej OAuth App po stronie Zenit-Linux, może nie być
+jeszcze dostępne w danej kompilacji. \fB\-\-status\fR pokazuje, skąd zpm
+weźmie token przy następnym zapytaniu, bez ujawniania samego tokenu.
+Token jest zapisywany w \fI~/.config/zpm/auth.json\fR (uprawnienia
+\fB0600\fR) i WALIDOWANY przed zapisem -- błędny/odwołany token nigdy
+nie trafia na dysk. Jeśli GitHub zwróci datę wygaśnięcia tokenu
+(fine-grained PAT / OAuth), zpm sam go zapomina po tej dacie, bez
+żadnej akcji użytkownika.
+.TP
+.B zpm logout
+(v0.6) Kasuje natychmiast zapamiętany przez \fBzpm login\fR token.
+.TP
+.B zpm cache status\fR, \fBzpm cache clear
+(v0.7) \fBstatus\fR pokazuje stan trzech lokalnych cache'y sieciowych
+używanych przy rozwiązywaniu "najnowszej wersji" dla pakietów
+\fBown\fR (TTL, manifest scentralizowany, fallback REST API --
+patrz \fBOPTYMALIZACJA ZAPYTAŃ API\fR niżej). \fBclear\fR czyści je
+wszystkie naraz -- przydatne, jeśli ktoś opublikuje błędny release
+i trzeba to natychmiast wymusić do odświeżenia, bez czekania na TTL.
+.SH OPTYMALIZACJA ZAPYTAŃ API (v0.6/v0.7)
+Rozwiązywanie "jaka jest najnowsza wersja" dla pakietów \fBown\fR bez
+przypiętej wersji na sztywno (patrz \fBzpm own install \fInazwa\fB@\fIwersja\fR
+wyżej) korzysta z czterech warstw, od najtańszej do najdroższej, żeby
+NIGDY niepotrzebnie nie uderzać w limitowane \fBapi.github.com\fR:
+.TP
+1. Lokalny cache z TTL (domyślnie 1h)
+Zero zapytań sieciowych w oknie ważności.
+.TP
+2. Scentralizowany manifest \fBlatest-versions.json\fR
+Generowany raz dziennie przez jeden, centralny workflow w repo
+\fBZenit-Linux/own-repository\fR, czytany przez
+\fBraw.githubusercontent.com\fR (inny, dużo luźniejszy limit niż
+\fBapi.github.com\fR). Jedno pobranie rozwiązuje od razu WSZYSTKIE
+pakiety \fBown\fR potrzebne w danym buildzie.
+.TP
+3. Redirect strony wydań
+\fBHEAD https://github.com/OWNER/REPO/releases/latest\fR -- zwykła
+strona WWW, w ogóle nie dotyka \fBapi.github.com\fR.
+.TP
+4. REST API z warunkowym \fBIf\-None\-Match\fR (ETag) + tokenem
+Ostatnia deska ratunku -- \fB304 Not Modified\fR nie liczy się do
+limitu, a token (patrz \fBzpm login\fR) podnosi go z 60/h do min.
+1000/h.
 .SH KOMENDY (TRYB ATOMOWY, binarka \-d:atomic)
 .TP
 .B zpm atomic create \fInazwa\fR [\fB\-\-base=\fIobraz\fR] [\fB\-\-engine=podman|buildah|chroot|nspawn\fR] [\fB\-\-memory=\fR4g] [\fB\-\-cpus=\fR2]
