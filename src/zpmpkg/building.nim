@@ -328,9 +328,22 @@ proc installIntoRootWithBackend(rootPath: string, spec: PackageSpec, cfg: ZpmCon
     # zawsze branch DOMYŚLNY zamiast tego, co jawnie zażyczono w
     # package.list. orchestrator.nim robi to poprawnie (patrz `branchFor`
     # tamże) -- tu naprawiamy dokładnie to samo dla trybu budowania.
+    #
+    # v0.6: TO SAMO dla WERSJI (nie branch) -- `zlb` koduje opcjonalny
+    # `version = "..."` z package.list wprost w nazwie pakietu jako
+    # "nazwa@wersja" (patrz PackageEntry.version w zlb i entryArg tamże),
+    # dokładnie w tej samej składni co `zpm own install <nazwa>@<wersja>`
+    # z linii poleceń -- `splitOwnNameVersion` (ownrepo.nim) obsługuje OBIE
+    # ścieżki identycznie. Podanie wersji na sztywno w package.list
+    # całkowicie omija zapytanie "jaka jest najnowsza wersja" do
+    # api.github.com (patrz resolveVersionPlaceholder) -- bez sieci, bez
+    # zużywania limitu, przewidywalne buildy.
+    let (realPkg, requestedVer) = splitOwnNameVersion(pkg)
     var branchFor = initTable[string, string]()
-    if spec.variant.len > 0: branchFor[pkg] = spec.variant
-    result = if installManyOwn(repo, cfg, @[pkg], destDir, rootPath, false, branchFor): 0 else: 1
+    if spec.variant.len > 0: branchFor[realPkg] = spec.variant
+    var versionFor = initTable[string, string]()
+    if requestedVer.len > 0: versionFor[realPkg] = requestedVer
+    result = if installManyOwn(repo, cfg, @[realPkg], destDir, rootPath, false, branchFor, versionFor): 0 else: 1
   else:
     log(&"[zpm --building] Nieznany backend budowania: {spec.backend}")
     result = 1
