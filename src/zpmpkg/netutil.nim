@@ -1,5 +1,6 @@
 import std/[httpclient, uri, os, json, strutils, strformat, times, osproc, sequtils]
 import ./types
+import ./auth
 import ./logging
 
 ## v0.2 -- wspólna warstwa sieciowa dla WSZYSTKICH pobrań zpm (remote_url/
@@ -119,6 +120,52 @@ proc remoteContentLength(url: string, timeoutMs: int): int64 =
   except CatchableError:
     -1
 
+proc githubAuthHeaderIfApplicable(url: string): seq[(string, string)] =
+  ## v0.5/v0.6 -- api.github.com ogranicza NIEZALOGOWANE zapytania do
+  ## zaledwie 60/godzinę NA ADRES IP -- na współdzielonych runnerach CI
+  ## (albo współdzielonym wyjściu do internetu wielu użytkowników w tej
+  ## samej sieci) ten limit potrafi się wyczerpać bardzo szybko, dając
+  ## mylące "403 rate limit exceeded" zamiast prawdziwego stanu repo.
+  ## `currentGithubToken()` (auth.nim) łączy DWA źródła w jednej,
+  ## spójnej kolejności: zmienna środowiskowa GITHUB_TOKEN/GH_TOKEN (CI,
+  ## krótkotrwała) ma pierwszeństwo nad tokenem zapamiętanym przez
+  ## `zpm login` (zwykli, interaktywni użytkownicy) -- ten drugi jest
+  ## automatycznie ignorowany/kasowany, gdy wygaśnie. Dotyczy WYŁĄCZNIE
+  ## api.github.com -- token nigdy nie trafia do żadnego innego hosta.
+  if not url.startsWith("https://api.github.com/"):
+    return @[]
+  let token = currentGithubToken()
+  if token.len == 0:
+    return @[]
+  @[("Authorization", &"Bearer {token}")]
+
+proc friendlyGithubError(url: string, code: HttpCode, headers: HttpHeaders, body: string): string =
+  ## v0.7 -- zamiast suchego "HTTP 403", tlumaczymy NAJCZESTSZA przyczyne
+  ## bledow na api.github.com na jasna podpowiedz, co z tym zrobic.
+  ## Rozroznia dwa realne przypadki:
+  ##   1. Wyczerpany anonimowy limit (60/h na adres IP) -- podpowiadamy
+  ##      `zpm login`.
+  ##   2. Token JEST ustawiony, ale i tak dostalismy 403/401 -- albo
+  ##      wygasl/zostal odwolany (401), albo (rzadko) i tak trafiono w
+  ##      limit mimo zalogowania (403 z X-RateLimit-Remaining: 0).
+  if not url.startsWith("https://api.github.com/"):
+    return &"HTTP {code}"
+  let remaining = headers.getOrDefault("X-RateLimit-Remaining")
+  let bodyLower = body.toLowerAscii()
+  let looksLikeRateLimit = "rate limit" in bodyLower or "secondary rate limit" in bodyLower
+  if code == Http401:
+    return "HTTP 401 -- GitHub odrzucił token (nieprawidłowy albo już wygasł). " &
+      "Uruchom 'zpm login' ponownie, żeby zapisać nowy."
+  if code == Http403 and (remaining == "0" or looksLikeRateLimit):
+    if currentGithubToken().len > 0:
+      return "HTTP 403 -- limit zapytań GitHub API wyczerpany MIMO zalogowania " &
+        "(rzadkie -- limit dla zalogowanych to zwykle 1000-5000/h). Spróbuj ponownie za chwilę."
+    else:
+      return "HTTP 403 -- wyczerpany anonimowy limit zapytań GitHub API (60/h na adres IP, " &
+        "współdzielony przez WSZYSTKICH na tej samej sieci/za tym samym NAT-em). " &
+        "Uruchom 'zpm login', żeby dostać własny, znacznie wyższy limit (min. 1000/h)."
+  &"HTTP {code}"
+
 proc safeFetchUrlBody*(url: string, cfg: ZpmConfig, label: string = "zpm:net"): FetchResult =
   let (allowed, reason) = hostAllowed(url, cfg)
   if not allowed:
@@ -130,10 +177,18 @@ proc safeFetchUrlBody*(url: string, cfg: ZpmConfig, label: string = "zpm:net"): 
   try:
     var client = newSafeClient(30_000)
     defer: client.close()
+    let authHeaders = githubAuthHeaderIfApplicable(url)
+    if authHeaders.len > 0:
+      logVerbose(&"[{label}] używam GITHUB_TOKEN/GH_TOKEN ze środowiska dla {url} (wyższy limit API)")
+      for (k, v) in authHeaders:
+        client.headers[k] = v
     let (pinOk, pinReason) = checkPinnedCert(client, url, cfg)
     if not pinOk:
       return FetchResult(ok: false, err: pinReason)
-    let body = client.getContent(url)
+    let resp = client.get(url)
+    if not resp.code.is2xx:
+      return FetchResult(ok: false, err: friendlyGithubError(url, resp.code, resp.headers, resp.body))
+    let body = resp.body
     if cfg.maxDownloadMb > 0 and body.len > cfg.maxDownloadMb * 1024 * 1024:
       return FetchResult(ok: false, err: &"pobrana treść ({body.len} B) przekracza security.max_download_mb={cfg.maxDownloadMb} (serwer nie podał wiarygodnego Content-Length z góry)")
     FetchResult(ok: true, body: body)
@@ -218,6 +273,8 @@ proc cachedFetch*(url, cachePath: string, cfg: ZpmConfig, label: string = "zpm:n
     var headers = newHttpHeaders({"User-Agent": "zpm/0.2"})
     if etag.len > 0: headers["If-None-Match"] = etag
     if lastMod.len > 0: headers["If-Modified-Since"] = lastMod
+    for (k, v) in githubAuthHeaderIfApplicable(url):
+      headers[k] = v
     client.headers = headers
 
     let resp = client.get(url)
@@ -239,7 +296,7 @@ proc cachedFetch*(url, cachePath: string, cfg: ZpmConfig, label: string = "zpm:n
       writeFile(metaPath, $meta)
       return FetchResult(ok: true, body: body, fromCache: false)
 
-    FetchResult(ok: false, err: &"HTTP {resp.status}")
+    FetchResult(ok: false, err: friendlyGithubError(url, resp.code, resp.headers, resp.body))
   except CatchableError as e:
     stderr.writeLine(&"[{label}] ✘ Pobieranie {url} nie powiodło się: {e.msg}")
     FetchResult(ok: false, err: e.msg)
