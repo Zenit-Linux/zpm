@@ -1,0 +1,26 @@
+func matches(string $pat, string $s): bool {
+    return step($pat, 0, $s, 0);
+}
+
+func step($p, $pi, $s, $si): bool {
+    $pn = strlen($p);
+    $sn = strlen($s);
+    while ($pi < $pn) {
+        $c = substr($p, $pi, 1);
+        if ($c === "*") {
+            while ($pi < $pn && substr($p, $pi, 1) === "*") { $pi++; }
+            if ($pi === $pn) { return true; }
+            for ($k = $si; $k <= $sn; $k++) { if (step($p, $pi, $s, $k)) { return true; } }
+            return false;
+        }
+        if ($si >= $sn) { return false; }
+        if ($c !== "?" && $c !== substr($s, $si, 1)) { return false; }
+        $pi++; $si++;
+    }
+    return $si === $sn;
+}
+
+func anyOf($patterns, string $s): bool {
+    foreach ($patterns as $p) { if (matches($p, $s)) { return true; } }
+    return false;
+}
