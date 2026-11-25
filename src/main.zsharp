@@ -1,1 +1,15 @@
+import Std.Os;
+import Workspace.util;
+import Workspace.cli;
 
+func main(): int {
+    try {
+        return cli.run(Os.args());
+    } catch (ZpmError $e) {
+        util.err($e->getMessage());
+        return 1;
+    } catch (Exception $e) {
+        util.err("wewnętrzny błąd: " . $e->getMessage());
+        return 70;
+    }
+}
