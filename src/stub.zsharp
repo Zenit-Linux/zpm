@@ -1,0 +1,87 @@
+import Std.Os;
+import Workspace.util;
+
+##
+ * stub — pakiet-atrapa RPM `zpm-stub-<profil>`: bez plików, tylko `Provides:`. Dzięki niemu `Requires: systemd` (także `>= N`
+ * i zależności od ścieżek jak /usr/bin/systemctl) jest spełnione bez instalowania prawdziwego systemd — solver zypper nie ma po co go wciągać.
+ * Budowanie wymaga rpmbuild (pakiet rpm-build).
+##
+
+func stubName($profile): string { return "zpm-stub-" . $profile["name"]; }
+
+# stabilny skrót listy zdolności (FNV-1a 32 bit, dziesiętnie) → pole Release; zmiana profilu = nowe wydanie
+func providesHash($list): int {
+    $h = 2166136261;
+    foreach (sort($list) as $s) {
+        $n = strlen($s);
+        for ($i = 0; $i < $n; $i++) { $h = (($h ^ ord(substr($s, $i, 1))) * 16777619) & 4294967295; }
+        $h = (($h ^ 10) * 16777619) & 4294967295;
+    }
+    return $h;
+}
+
+func release($profile): string { return strval(providesHash($profile["provides"])); }
+
+func spec($profile): string {
+    $s = "%global debug_package %{nil}\n%define _build_id_links none\n%define __os_install_post %{nil}\n%define _binary_payload w9.gzdio\n\n";
+    $s .= "Name:           " . stubName($profile) . "\nVersion:        1.0\nRelease:        " . release($profile) . "\n";
+    $s .= "Summary:        zpm: atrapa zależności dla profilu " . $profile["name"] . "\nLicense:        MPL-2.0\nGroup:          System/Base\nBuildArch:      noarch\n";
+    foreach ($profile["provides"] as $p) { $s .= "Provides:       " . $p . "\n"; }
+    $s .= "\n%description\nPakiet bez plików zgłaszający zdolności prawdziwych pakietów (" . join($profile["provides"], ", ") . ").\n";
+    $s .= "Utworzony przez zpm dla profilu " . $profile["name"] . ": spełnia zależności bez wciągania zastąpionych pakietów.\n\n%files\n";
+    return $s;
+}
+
+# buduje RPM; zwraca ścieżkę. $outDir = gdzie zostawić plik.
+func build($env, $profile, $outDir) {
+    if (!$profile["stub"]) { util.die("profil " . $profile["name"] . " nie definiuje atrapy (provides puste)"); }
+    $name = stubName($profile);
+    $rpmName = $name . "-1.0-" . release($profile) . ".noarch.rpm";
+    $dest = util.pjoin($outDir, $rpmName);
+    if ($env->r->dry) { $env->r->capture(["rpmbuild", "-bb", $name . ".spec"]); return $dest; }
+    if (Os.which("rpmbuild") === null) { util.die("brak rpmbuild — zainstaluj pakiet rpm-build"); }
+    $tmp = Os.mkdtemp("zpm-");
+    try {
+        foreach (["SPECS", "RPMS", "BUILD", "BUILDROOT", "SOURCES", "SRPMS"] as $d) { Os.mkdir(util.pjoin($tmp, $d)); }
+        $specFile = util.pjoin($tmp, "SPECS/" . $name . ".spec");
+        Os.writeFile($specFile, spec($profile));
+        $res = $env->r->capture(["rpmbuild", "-bb", "--define", "_topdir " . $tmp, "--define", "_rpmdir " . $tmp . "/RPMS", $specFile]);
+        $built = util.pjoin($tmp, "RPMS/noarch/" . $rpmName);
+        if ($res["status"] !== 0 || !Os.isFile($built)) { util.die("rpmbuild nie powiódł się:\n" . $res["stdout"] . $res["stderr"]); }
+        Os.mkdir($outDir);
+        $cp = $env->r->run(["cp", "-f", $built, $dest]);   # RPM jest binarny — nie przez Os.copy (tekst UTF-8)
+        if ($cp !== 0) { util.die("nie udało się skopiować RPM do " . $dest); }
+    } finally {
+        Os.removeAll($tmp);
+    }
+    return $dest;
+}
+
+func installRpm($env, $rpmPath) {
+    $st = $env->r->run($env->rpm(["-U", "--oldpackage", "--replacepkgs", "--nodeps", $rpmPath]));
+    if ($st !== 0) { util.die("rpm -U nie powiódł się (kod " . $st . ")"); }
+}
+
+# "none" | "outdated" | "ok"
+func status($env, $profile): string {
+    if (!$profile["stub"]) { return "none"; }
+    $res = $env->r->capture($env->rpm(["-q", "--qf", "%{RELEASE}", stubName($profile)]));
+    if ($res["status"] !== 0) { return "none"; }
+    return trim($res["stdout"]) === release($profile) ? "ok" : "outdated";
+}
+
+func ensure($env, $profile, $cacheDir = null): string {
+    $st = status($env, $profile);
+    if ($st === "ok") { return "ok"; }
+    $dir = $cacheDir ?? util.inRoot($env->root, "/var/cache/zpm");
+    $env->r->mkdirp($dir);
+    $rpmPath = build($env, $profile, $dir);
+    installRpm($env, $rpmPath);
+    return $st === "none" ? "installed" : "updated";
+}
+
+func remove($env, $profile) {
+    if (status($env, $profile) === "none") { return false; }
+    $env->r->run($env->rpm(["-e", "--nodeps", stubName($profile)]));
+    return true;
+}
