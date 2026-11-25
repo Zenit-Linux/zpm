@@ -1,0 +1,33 @@
+import Workspace.util;
+import Workspace.stub;
+import Workspace.guard;
+
+##
+ * doctor — spójność profilu: atrapa, blokady, zainstalowane zastąpione pakiety, kto dostarcza `systemd`.
+##
+func check($env): array {
+    $p = $env->profile;
+    $rows = [];
+    $bad = 0;
+    $rows[] = ["profil", true, $p["name"] . " — " . $p["description"]];
+    if ($p["stub"]) {
+        $s = stub.status($env, $p);
+        $ok = $s === "ok";
+        if (!$ok) { $bad++; }
+        $rows[] = ["atrapa " . stub.stubName($p), $ok, $s === "ok" ? "zainstalowana, aktualna" : ($s === "none" ? "BRAK (zpm guard)" : "nieaktualna (zpm guard)")];
+    }
+    $text = guard.locksText($env);
+    foreach ($p["block"] as $pat) {
+        $has = guard.hasLock($text, $pat);
+        if (!$has) { $bad++; }
+        $rows[] = ["blokada " . $pat, $has, $has ? "jest" : "BRAK (zpm guard)"];
+    }
+    $inst = guard.installedBlocked($env, $p);
+    if (count($inst) > 0) { $bad++; }
+    $rows[] = ["zastąpione pakiety", count($inst) === 0, count($inst) === 0 ? "żaden nie jest zainstalowany" : "ZAINSTALOWANE: " . join($inst, " ") . " (zpm guard --purge)"];
+    if (count($p["block"]) > 0) {
+        $w = $env->r->capture($env->rpm(["-q", "--whatprovides", "systemd"]));
+        $rows[] = ["dostawca 'systemd'", $w["status"] === 0, $w["status"] === 0 ? trim(replace($w["stdout"], "\n", " ")) : "nikt (zależności od systemd się nie spełnią)"];
+    }
+    return ["rows" => $rows, "bad" => $bad];
+}
