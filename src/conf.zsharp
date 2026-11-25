@@ -1,0 +1,58 @@
+import Std.Os;
+import Std.Toml;
+import Workspace.util;
+import Workspace.runner;
+import Workspace.profiles;
+
+##
+ * conf — /etc/zpm/zpm.conf (TOML):  profile = "zenitd"   guard = true
+ * Env — to, co potrzebuje każda operacja: root, profil, runner, opcje zypper przekazywane dalej.
+##
+
+func confPath($root): string { return util.inRoot($root, "/etc/zpm/zpm.conf"); }
+
+func readConf($root): array {
+    $p = confPath($root);
+    if (!Os.isFile($p)) { return []; }
+    try { return Toml.decode(Os.readFile($p)); }
+    catch (Exception $e) { util.die($p . ": " . $e->getMessage()); }
+}
+
+func writeConf($root, $c, $r) {
+    $p = confPath($root);
+    $r->mkdirp(util.inRoot($root, "/etc/zpm"));
+    if ($r->dry) { return; }
+    File.write($p, "# /etc/zpm/zpm.conf — zarządzane przez zpm\n" . Toml.encode($c));
+}
+
+class Env {
+    public $root = "";
+    public $r;
+    public $zypperArgs = [];     # opcje globalne zypper przekazywane dalej (bez --root)
+    public $profileName = null;
+    public $guardEnabled = true;
+    public $conf = [];
+    public $profile = null;
+
+    public function __construct($r) { $this->r = $r; }
+
+    public function resolve($flagProfile) {
+        $this->conf = readConf($this->root);
+        $name = $flagProfile ?? Os.env("ZPM_PROFILE") ?? ($this->conf["profile"] ?? null);
+        if ($name === null || $name === "") { $name = "systemd"; }
+        $this->profileName = $name;
+        $this->profile = profiles.load($name, $this->root);
+        if (has_key($this->conf, "guard") && $this->conf["guard"] === false) { $this->guardEnabled = false; }
+        return $this;
+    }
+
+    public function rootArgs() { return ($this->root === "" || $this->root === "/") ? [] : ["--root", $this->root]; }
+    public function rpm($args) { return ["rpm", ...$this->rootArgs(), ...$args]; }
+    # wywołania wewnętrzne zpm (blokady, symulacje) są zawsze nieinteraktywne — bez dublowania opcji użytkownika
+    public function zypperNI($args) {
+        $g = $this->zypperArgs;
+        $has = in_array("--non-interactive", $g) || in_array("-n", $g);
+        return ["zypper", ...$this->rootArgs(), ...$g, ...($has ? [] : ["--non-interactive"]), ...$args];
+    }
+    public function zypper($args) { return ["zypper", ...$this->rootArgs(), ...$this->zypperArgs, ...$args]; }
+}
