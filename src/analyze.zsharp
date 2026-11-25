@@ -1,0 +1,33 @@
+import Workspace.util;
+import Workspace.glob;
+
+##
+ * analyze — symulacja instalacji (zypper install --dry-run) i wskazanie, czy transakcja wciągnęłaby zastąpione pakiety.
+##
+
+# nazwy z sekcji "The following ... going to be installed:" w wyjściu zypper
+func newPackages($text): array {
+    $out = [];
+    $in = false;
+    foreach (util.lines($text) as $l) {
+        if (starts_with($l, "The following") && contains($l, "going to be installed")) { $in = true; continue; }
+        if ($in) {
+            if (!starts_with($l, " ")) { $in = false; continue; }
+            foreach (split(trim($l), " ") as $tok) { if ($tok !== "") { $out[] = $tok; } }
+        }
+    }
+    return $out;
+}
+
+func blocked($pkgs, $profile): array {
+    $b = [];
+    foreach ($pkgs as $n) { if (glob.anyOf($profile["block"], $n) && !glob.anyOf($profile["allow"], $n)) { $b[] = $n; } }
+    return $b;
+}
+
+# zwraca ["status" => kod zypper, "packages" => [...], "blocked" => [...]]
+func run($env, $profile, $names): array {
+    $r = $env->r->capture($env->zypperNI(["install", "--dry-run", "--no-recommends", ...$names]));
+    $all = newPackages($r["stdout"]);
+    return ["status" => $r["status"], "packages" => $all, "blocked" => blocked($all, $profile), "raw" => $r["stdout"] . $r["stderr"]];
+}
