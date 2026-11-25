@@ -1,1 +1,20 @@
+[package]
+name = "zpm"
+version = "0.1.0"
+kind = "bin"
+entry = "src/main.zsharp"
+description = "zpm — nakładka na zypper (Zenit Package Manager): profile init, pakiety-atrapy (Provides) zamiast wciągania systemd, kontrola zależności"
+license = "MPL-2.0"
 
+# `import Workspace.<człon>;` — ścieżki względem tego pliku
+[workspace.members]
+util     = "src/util.zsharp"
+runner   = "src/runner.zsharp"
+glob     = "src/glob.zsharp"
+profiles = "src/profiles.zsharp"
+conf     = "src/conf.zsharp"
+stub     = "src/stub.zsharp"
+guard    = "src/guard.zsharp"
+analyze  = "src/analyze.zsharp"
+doctor   = "src/doctor.zsharp"
+cli      = "src/cli.zsharp"
