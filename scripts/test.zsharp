@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Testy zpm w interpreterze stage0 (zsc0). Testy z rpmbuild uruchamiają się, gdy rpm/rpmbuild są w PATH.
+set -u
+ZSC0="${ZSC0:-zsc0}"
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$HERE"
+export TERM=dumb NO_COLOR=1
+out="$("$ZSC0" run tests/t_core.zsharp 2>&1)"; rc=$?
+ok=$(printf '%s\n' "$out" | grep -c '^ok'); fl=$(printf '%s\n' "$out" | grep -c '^FAIL')
+printf '%s\n' "$out" | grep -E '^(FAIL|wynik|skip)|Nieobsłużony'
+echo "asercje ok=$ok fail=$fl rc=$rc"
+[ "$rc" -eq 0 ] && [ "$fl" -eq 0 ]
