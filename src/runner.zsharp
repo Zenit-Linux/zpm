@@ -1,0 +1,43 @@
+import Std.Os;
+import Workspace.util;
+
+##
+ * Jedyne miejsce uruchamiające procesy (testowalne: tryb dry, odpowiedzi atrapy dla capture).
+##
+class Runner {
+    public $dry = false;
+    public $history = [];
+    public $fake = [];      # fragment polecenia => [status, stdout]
+
+    public function __construct($dry = false) { $this->dry = $dry; }
+
+    private function note($argv) {
+        $line = util.shjoin($argv);
+        $this->history[] = $line;
+        if ($this->dry) { eecho(util.paint("2", "[dry] " . $line)); } else { util.debug("$ " . $line); }
+        return $line;
+    }
+
+    # z dziedziczonym wyjściem; zwraca kod wyjścia
+    public function run($argv) {
+        $this->note($argv);
+        if ($this->dry) { return 0; }
+        return Process.exec($argv[0], array_slice($argv, 1));
+    }
+
+    public function capture($argv) {
+        $line = $this->note($argv);
+        foreach ($this->fake as $frag => $res) {
+            if (contains($line, $frag)) { return ["status" => $res[0], "stdout" => $res[1], "stderr" => ""]; }
+        }
+        if ($this->dry) { return ["status" => 0, "stdout" => "", "stderr" => ""]; }
+        return Process.run($argv[0], array_slice($argv, 1));
+    }
+
+    public function mkdirp($p) {
+        if ($this->dry) { $this->note(["mkdir", "-p", $p]); return 0; }
+        return Process.run("mkdir", ["-p", $p])["status"];
+    }
+
+    public function ok($argv) { return $this->capture($argv)["status"] === 0; }
+}
