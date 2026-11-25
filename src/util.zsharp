@@ -1,0 +1,76 @@
+import Std.Os;
+
+class ZpmError extends Exception { }
+
+func die($msg) { throw new ZpmError($msg); }
+
+func shq($s): string { return "'" . replace(strval($s), "'", "'\\''") . "'"; }
+func shjoin($argv): string { return join(map($argv, fn($a) => shq($a)), " "); }
+
+func useColor(): bool {
+    if (Os.env("NO_COLOR") !== null) { return false; }
+    return Os.env("TERM", "dumb") !== "dumb";
+}
+func paint($code, $s) { return useColor() ? chr(27) . "[" . $code . "m" . $s . chr(27) . "[0m" : $s; }
+func info($s): void { eecho(paint("32", "zpm:") . " " . $s); }
+func warn($s): void { eecho(paint("33", "zpm: uwaga:") . " " . $s); }
+func err($s): void { eecho(paint("31", "zpm: błąd:") . " " . $s); }
+func debug($s): void { if (Os.env("ZPM_VERBOSE", "") === "1") { eecho(paint("2", "zpm: " . $s)); } }
+
+func isList($a): bool {
+    if (!is_array($a)) { return false; }
+    $i = 0;
+    foreach ($a as $k => $v) { if ($k !== $i) { return false; } $i++; }
+    return true;
+}
+func isMap($a): bool { return is_array($a) && !isList($a); }
+
+func merge($base, $over) {
+    if (!isMap($base) || !isMap($over)) { return $over; }
+    $out = $base;
+    foreach ($over as $k => $v) {
+        $out[$k] = (has_key($out, $k) && isMap($out[$k]) && isMap($v)) ? merge($out[$k], $v) : $v;
+    }
+    return $out;
+}
+
+func get($cfg, string $path, $default = null) {
+    $cur = $cfg;
+    foreach (split($path, ".") as $seg) {
+        if (!is_array($cur) || !has_key($cur, $seg)) { return $default; }
+        $cur = $cur[$seg];
+    }
+    return $cur;
+}
+
+func uniq($list) {
+    $seen = [];
+    $out = [];
+    foreach ($list as $x) {
+        if (!has_key($seen, strval($x))) { $seen[strval($x)] = true; $out[] = $x; }
+    }
+    return $out;
+}
+
+func asList($v) { return $v === null ? [] : (is_array($v) ? values($v) : [$v]); }
+
+func lines(string $text) {
+    $out = split(replace($text, "\r\n", "\n"), "\n");
+    if (count($out) > 0 && $out[count($out) - 1] === "") { $out = array_slice($out, 0, count($out) - 1); }
+    return $out;
+}
+
+func pjoin(...$parts): string {
+    $out = "";
+    foreach ($parts as $p) {
+        if ($p === "" || $p === null) { continue; }
+        if ($out === "") { $out = $p; continue; }
+        while (strlen($out) > 1 && ends_with($out, "/")) { $out = substr($out, 0, strlen($out) - 1); }
+        while (starts_with($p, "/")) { $p = substr($p, 1); }
+        $out = $out . "/" . $p;
+    }
+    return $out;
+}
+
+# ścieżka wewnątrz --root
+func inRoot($root, $path) { return ($root === "" || $root === "/") ? $path : pjoin($root, $path); }
