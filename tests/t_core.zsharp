@@ -1,0 +1,149 @@
+import Std.Os;
+import Workspace.util;
+import Workspace.runner;
+import Workspace.glob;
+import Workspace.profiles;
+import Workspace.conf;
+import Workspace.stub;
+import Workspace.guard;
+import Workspace.analyze;
+import Workspace.cli;
+
+func eq($name, $got, $want) {
+    if ($got === $want) { echo "ok   " . $name; return 0; }
+    echo "FAIL " . $name . " got=" . dump2($got) . " want=" . dump2($want);
+    return 1;
+}
+func dump2($v) { return is_array($v) ? "[" . join(map($v, fn($x) => dump2($x)), ",") . "]" : strval($v); }
+func throws($name, $fn, $frag) {
+    try { $fn(); } catch (Exception $e) {
+        if (contains($e->getMessage(), $frag)) { echo "ok   " . $name; return 0; }
+        echo "FAIL " . $name . " zły komunikat: " . $e->getMessage(); return 1;
+    }
+    echo "FAIL " . $name . " brak wyjątku"; return 1;
+}
+$f = 0;
+
+# glob
+$f += eq("glob exact", glob.matches("systemd", "systemd"), true);
+$f += eq("glob star", glob.matches("systemd-*", "systemd-sysvcompat"), true);
+$f += eq("glob star no base", glob.matches("systemd-*", "systemd"), false);
+$f += eq("glob star not libsystemd0", glob.matches("systemd-*", "libsystemd0"), false);
+$f += eq("glob mid", glob.matches("a*c", "abbbc"), true);
+$f += eq("glob q", glob.matches("a?c", "abc"), true);
+$f += eq("glob q len", glob.matches("a?c", "ac"), false);
+$f += eq("glob anyOf", glob.anyOf(["x", "systemd*"], "systemd-boot"), true);
+
+# profile
+$z = profiles.load("zenitd");
+$f += eq("zenitd stub", $z["stub"], true);
+$f += eq("zenitd block", $z["block"], ["systemd", "systemd-*"]);
+$f += eq("zenitd provides systemd", in_array("systemd = 99999", $z["provides"]), true);
+$f += eq("zenitd provides systemctl path", in_array("/usr/bin/systemctl", $z["provides"]), true);
+$s = profiles.load("systemd");
+$f += eq("systemd profile inert", $s["stub"] === false && count($s["block"]) === 0, true);
+$f += throws("profile unknown", fn() => profiles.load("nope"), "nieznany profil");
+
+# własny profil z pliku
+$tmp = Os.mkdtemp("zpmt-");
+Os.mkdir($tmp . "/etc/zpm/profiles.d");
+Os.writeFile($tmp . "/etc/zpm/profiles.d/s6.toml", "description = \"s6 init\"\nblock = [\"systemd\", \"systemd-*\", \"udev\"]\nallow = [\"systemd-rpm-macros\"]\nprovides = [\"systemd = 99999\"]\n");
+$p = profiles.load("s6", $tmp);
+$f += eq("custom profile block", $p["block"], ["systemd", "systemd-*", "udev"]);
+$f += eq("custom stub auto", $p["stub"], true);
+$f += eq("names include custom", in_array("s6", profiles.names($tmp)), true);
+Os.writeFile($tmp . "/etc/zpm/profiles.d/zenitd.toml", "block = [\"systemd\"]\n");
+$f += eq("override builtin merges", profiles.load("zenitd", $tmp)["block"], ["systemd"]);
+$f += eq("override keeps provides", count(profiles.load("zenitd", $tmp)["provides"]) > 5, true);
+File.delete($tmp . "/etc/zpm/profiles.d/zenitd.toml");
+
+# stub spec
+$sp = stub.spec($z);
+$f += eq("spec name", contains($sp, "Name:           zpm-stub-zenitd"), true);
+$f += eq("spec noarch", contains($sp, "BuildArch:      noarch"), true);
+$f += eq("spec provides", contains($sp, "Provides:       systemd = 99999"), true);
+$f += eq("spec empty files", ends_with($sp, "%files\n"), true);
+$f += eq("hash stable", stub.providesHash(["a", "b"]), stub.providesHash(["b", "a"]));
+$f += eq("hash differs", stub.providesHash(["a"]) !== stub.providesHash(["b"]), true);
+
+# analyze parser
+$out = "Loading repository data...\nResolving package dependencies...\n\nThe following 6 NEW packages are going to be installed:\n  foo libfoo1 systemd\n  systemd-sysvcompat bar\n  zlib1\n\n6 new packages to install.\n";
+$np = analyze.newPackages($out);
+$f += eq("analyze parse", $np, ["foo", "libfoo1", "systemd", "systemd-sysvcompat", "bar", "zlib1"]);
+$f += eq("analyze blocked", analyze.blocked($np, $z), ["systemd", "systemd-sysvcompat"]);
+$f += eq("analyze singular", analyze.newPackages("The following package is going to be installed:\n  solo\n\n"), ["solo"]);
+$f += eq("analyze none", analyze.newPackages("Nothing to do.\n"), []);
+$f += eq("analyze allow", analyze.blocked(["systemd-rpm-macros"], $p), []);
+
+# parse CLI
+$a = cli.parse(["--root", "/r", "--non-interactive", "--pkg-cache-dir", "/c", "--profile", "zenitd", "install", "--no-recommends", "foo"]);
+$f += eq("cli root", $a["root"], "/r");
+$f += eq("cli profile", $a["profile"], "zenitd");
+$f += eq("cli globals", $a["globals"], ["--non-interactive", "--pkg-cache-dir", "/c"]);
+$f += eq("cli cmd", $a["cmd"], "install");
+$f += eq("cli rest", $a["rest"], ["--no-recommends", "foo"]);
+$a2 = cli.parse(["-R=x"]);
+$f += eq("cli short flag stays global", $a2["globals"], ["-R=x"]);
+$a3 = cli.parse(["--root=/q", "se", "--root", "y"]);
+$f += eq("cli opts after cmd untouched", $a3["rest"], ["--root", "y"]);
+$f += eq("cli root eq form", $a3["root"], "/q");
+$f += throws("cli missing value", fn() => cli.parse(["--profile"]), "wymaga wartości");
+
+# Env + polecenia budowane dla zypper/rpm
+$r = new Runner(true);
+$env = new Env($r);
+$env->root = "/r";
+$env->zypperArgs = ["--non-interactive"];
+$env->resolve("zenitd");
+$f += eq("env zypper", $env->zypper(["install", "x"]), ["zypper", "--root", "/r", "--non-interactive", "install", "x"]);
+$f += eq("env rpm", $env->rpm(["-q", "x"]), ["rpm", "--root", "/r", "-q", "x"]);
+$f += eq("env zypperNI no dup", $env->zypperNI(["addlock", "x"]), ["zypper", "--root", "/r", "--non-interactive", "addlock", "x"]);
+$e0 = new Env($r); $e0->resolve(null);
+$f += eq("env default profile", $e0->profileName, "systemd");
+$f += eq("env no root", $e0->rpm(["-qa"]), ["rpm", "-qa"]);
+
+# guard: blokady dodawane tylko brakujące; purge po atrapie
+$r2 = new Runner(true);
+$r2->fake = ["-qa" => [0, "bash\nsystemd\nsystemd-sysvcompat\nlibsystemd0\nudev\nzpm-stub-zenitd\n"], "--qf %{RELEASE}" => [1, ""]];
+$g = new Env($r2); $g->root = $tmp; $g->resolve("zenitd");
+$f += eq("installedBlocked", guard.installedBlocked($g, $g->profile), ["systemd", "systemd-sysvcompat"]);
+Os.mkdir($tmp . "/etc/zypp");
+Os.writeFile($tmp . "/etc/zypp/locks", "\nsolvable_name: systemd\nmatch_type: exact\n");
+$f += eq("hasLock yes", guard.hasLock(guard.locksText($g), "systemd"), true);
+$f += eq("hasLock no", guard.hasLock(guard.locksText($g), "systemd-*"), false);
+$res = guard.ensure($g, $g->profile, true);
+$f += eq("guard adds only missing lock", $res["locks"], ["systemd-*"]);
+$f += eq("guard removed", $res["removed"], ["systemd", "systemd-sysvcompat"]);
+$hist = join($r2->history, "\n");
+$f += eq("guard order: stub before purge", index_of($hist, "-U") < index_of($hist, "-e") && index_of($hist, "-U") >= 0, true);
+$sysEnv = new Env($r2); $sysEnv->resolve("systemd");
+$f += eq("guard systemd profile no-op", guard.ensure($sysEnv, profiles.load("systemd"), true)["stub"], "none");
+
+# profile set (prawdziwy zapis w katalogu tymczasowym)
+$rr = new Runner(false);
+$pe = new Env($rr); $pe->root = $tmp; $pe->resolve(null);
+$c = $pe->conf; $c["profile"] = "openrc";
+conf.writeConf($tmp, $c, $rr);
+$pe2 = new Env($rr); $pe2->root = $tmp; $pe2->resolve(null);
+$f += eq("conf roundtrip", $pe2->profileName, "openrc");
+$f += eq("--profile beats conf", (new Env($rr))->resolve("runit")->profileName, "runit");
+
+# prawdziwy rpmbuild + rpm --root (jeśli dostępne)
+if (Os.which("rpmbuild") !== null && Os.which("rpm") !== null) {
+    $root = $tmp . "/rpmroot";
+    Os.mkdir($root);
+    Process.run("rpm", ["--root", $root, "--initdb"]);
+    $re = new Env(new Runner(false)); $re->root = $root; $re->resolve("zenitd");
+    $f += eq("real stub status none", stub.status($re, $re->profile), "none");
+    $f += eq("real stub install", stub.ensure($re, $re->profile, $tmp . "/cache"), "installed");
+    $f += eq("real stub status ok", stub.status($re, $re->profile), "ok");
+    $f += eq("real stub idempotent", stub.ensure($re, $re->profile, $tmp . "/cache"), "ok");
+    $prov = Process.run("rpm", ["--root", $root, "-q", "--whatprovides", "systemd"]);
+    $f += eq("real provides systemd", contains($prov["stdout"], "zpm-stub-zenitd"), true);
+    $f += eq("real remove", stub.remove($re, $re->profile), true);
+    $f += eq("real status after remove", stub.status($re, $re->profile), "none");
+} else { echo "skip  testy rpmbuild (brak rpmbuild/rpm)"; }
+
+Os.removeAll($tmp);
+echo "wynik: " . ($f === 0 ? "wszystko OK" : $f . " niepowodzeń");
+exit($f === 0 ? 0 : 1);
