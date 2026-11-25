@@ -1,0 +1,189 @@
+import Std.Os;
+import Std.Toml;
+import Workspace.util;
+import Workspace.runner;
+import Workspace.profiles;
+import Workspace.conf;
+import Workspace.stub;
+import Workspace.guard;
+import Workspace.analyze;
+import Workspace.doctor;
+
+func version(): string { return "zpm 0.1.0"; }
+
+func usage(): void {
+    echo "zpm — nakładka na zypper dla dystrybucji bez systemd (Zenit Package Manager)";
+    echo "";
+    echo "Każde polecenie zypper działa jak zwykle (zpm install ..., zpm dup, zpm se ...); przed transakcjami zpm pilnuje profilu init.";
+    echo "";
+    echo "polecenia zpm:";
+    echo "  profile list|show [NAZWA]|set NAZWA|current   profil init (systemd, zenitd, nosystemd, openrc, runit, własne)";
+    echo "  guard [--purge]       zainstaluj atrapę Provides + blokady (--purge: usuń zastąpione pakiety, które już są)";
+    echo "  unguard               zdejmij blokady i usuń atrapę";
+    echo "  stub build [--out D] | install | remove | status | spec    pakiet-atrapa RPM (wymaga rpmbuild)";
+    echo "  analyze PAKIET...     symulacja instalacji: czy wciągnęłaby zastąpione pakiety?";
+    echo "  doctor                spójność profilu (atrapa, blokady, zainstalowane pakiety)";
+    echo "  config                pokaż /etc/zpm/zpm.conf";
+    echo "  version | help";
+    echo "";
+    echo "opcje zpm (przed poleceniem):";
+    echo "  -R, --root KATALOG    działaj na rootfs (jak zypper --root)";
+    echo "  --profile NAZWA       wymuś profil (domyślnie: /etc/zpm/zpm.conf, ZPM_PROFILE, w ostateczności systemd)";
+    echo "  --no-guard            nie uruchamiaj strażnika przed transakcją";
+    echo "  --zpm-dry             tylko pokaż polecenia, których zpm użyłby";
+    echo "Pozostałe opcje globalne (--non-interactive, --pkg-cache-dir ...) trafiają do zypper.";
+}
+
+func zypperValueOpts(): array {
+    return ["--reposd-dir", "-D", "--cache-dir", "-C", "--raw-cache-dir", "--solv-cache-dir", "--pkg-cache-dir", "--userdata", "--config", "-c", "--zypp-conf"];
+}
+
+func ownCommands(): array { return ["profile", "guard", "unguard", "stub", "analyze", "doctor", "config", "version", "help"]; }
+func transactionCommands(): array { return ["install", "in", "update", "up", "dist-upgrade", "dup", "patch", "inr", "install-new-recommends"]; }
+
+##
+ * [zpm-opcje][opcje-globalne-zypper] polecenie [reszta...]
+ * Wynik: ["root","profile","noGuard","dry","globals","cmd","rest"]
+##
+func parse($argv): array {
+    $r = ["root" => "", "profile" => null, "noGuard" => false, "dry" => false, "globals" => [], "cmd" => null, "rest" => []];
+    $n = count($argv);
+    for ($i = 0; $i < $n; $i++) {
+        $a = $argv[$i];
+        if ($r["cmd"] !== null) { $r["rest"][] = $a; continue; }
+        $name = $a;
+        $val = null;
+        if (starts_with($a, "--") && index_of($a, "=") > 0) { $name = substr($a, 0, index_of($a, "=")); $val = substr($a, index_of($a, "=") + 1); }
+        if ($name === "--root" || $name === "-R" || $name === "--profile") {
+            if ($val === null) {
+                if ($i + 1 >= $n) { util.die("opcja " . $name . " wymaga wartości"); }
+                $i++;
+                $val = $argv[$i];
+            }
+            if ($name === "--profile") { $r["profile"] = $val; } else { $r["root"] = $val; }
+        } elseif ($name === "--no-guard") { $r["noGuard"] = true; }
+        elseif ($name === "--zpm-dry") { $r["dry"] = true; }
+        elseif (in_array($name, zypperValueOpts())) {
+            if ($val === null) {
+                if ($i + 1 >= $n) { util.die("opcja " . $name . " wymaga wartości"); }
+                $i++;
+                $r["globals"][] = $a;
+                $r["globals"][] = $argv[$i];
+            } else { $r["globals"][] = $a; }
+        } elseif (starts_with($a, "-")) { $r["globals"][] = $a; }
+        else { $r["cmd"] = $a; }
+    }
+    return $r;
+}
+
+func makeEnv($p): Env {
+    $env = new Env(new Runner($p["dry"]));
+    $env->root = $p["root"];
+    $env->zypperArgs = $p["globals"];
+    return $env->resolve($p["profile"]);
+}
+
+func cmdProfile($env, $rest, $p) {
+    $sub = count($rest) > 0 ? $rest[0] : "current";
+    if ($sub === "list") {
+        foreach (profiles.names($env->root) as $n) {
+            $pr = profiles.load($n, $env->root);
+            echo ($n === $env->profileName ? "* " : "  ") . $n . "\t" . $pr["description"];
+        }
+        return 0;
+    }
+    if ($sub === "current") { echo $env->profileName; return 0; }
+    if ($sub === "show") {
+        $pr = count($rest) > 1 ? profiles.load($rest[1], $env->root) : $env->profile;
+        echo "nazwa:    " . $pr["name"];
+        echo "opis:     " . $pr["description"];
+        echo "atrapa:   " . ($pr["stub"] ? "tak (" . stub.stubName($pr) . ")" : "nie");
+        echo "blokady:  " . join($pr["block"], " ");
+        echo "provides: " . join($pr["provides"], ", ");
+        return 0;
+    }
+    if ($sub === "set") {
+        if (count($rest) < 2) { util.die("użycie: zpm profile set NAZWA"); }
+        profiles.load($rest[1], $env->root);   # walidacja nazwy
+        $c = $env->conf;
+        $c["profile"] = $rest[1];
+        conf.writeConf($env->root, $c, $env->r);
+        util.info("profil: " . $rest[1] . " (" . conf.confPath($env->root) . ")");
+        return 0;
+    }
+    util.die("użycie: zpm profile list|show [NAZWA]|set NAZWA|current");
+}
+
+func cmdGuard($env, $rest) {
+    $purge = in_array("--purge", $rest);
+    $res = guard.ensure($env, $env->profile, $purge);
+    util.info("atrapa: " . $res["stub"] . "; nowe blokady: " . count($res["locks"]) . "; usunięte pakiety: " . count($res["removed"]));
+    return 0;
+}
+
+func cmdStub($env, $rest) {
+    $sub = count($rest) > 0 ? $rest[0] : "status";
+    $pr = $env->profile;
+    if ($sub === "spec") { echo stub.spec($pr); return 0; }
+    if ($sub === "status") { echo stub.stubName($pr) . ": " . stub.status($env, $pr); return 0; }
+    if ($sub === "build") {
+        $out = ".";
+        for ($i = 1; $i < count($rest); $i++) { if ($rest[$i] === "--out" && $i + 1 < count($rest)) { $out = $rest[$i + 1]; } }
+        echo stub.build($env, $pr, $out);
+        return 0;
+    }
+    if ($sub === "install") { util.info("atrapa: " . stub.ensure($env, $pr)); return 0; }
+    if ($sub === "remove") { util.info(stub.remove($env, $pr) ? "usunięto" : "nie było zainstalowane"); return 0; }
+    util.die("użycie: zpm stub build [--out D] | install | remove | status | spec");
+}
+
+func cmdAnalyze($env, $rest) {
+    if (count($rest) === 0) { util.die("użycie: zpm analyze PAKIET..."); }
+    $a = analyze.run($env, $env->profile, $rest);
+    if ($a["status"] !== 0 && count($a["packages"]) === 0) { eecho($a["raw"]); util.die("zypper zakończył się kodem " . $a["status"]); }
+    echo "do zainstalowania: " . count($a["packages"]) . " pakietów";
+    if (count($a["blocked"]) > 0) {
+        util.warn("transakcja wciągnęłaby zastąpione pakiety: " . join($a["blocked"], " ") . " — uruchom `zpm guard`");
+        return 3;
+    }
+    echo "OK: żaden zastąpiony pakiet nie zostanie wciągnięty";
+    return 0;
+}
+
+func cmdDoctor($env) {
+    $d = doctor.check($env);
+    foreach ($d["rows"] as $row) {
+        $mark = $row[1] ? util.paint("32", "ok  ") : util.paint("31", "BŁĄD");
+        echo $mark . " " . $row[0] . ": " . $row[2];
+    }
+    return $d["bad"] > 0 ? 1 : 0;
+}
+
+func passThrough($env, $p) {
+    $args = [$p["cmd"], ...$p["rest"]];
+    if (in_array($p["cmd"], transactionCommands()) && !$p["noGuard"] && $env->guardEnabled) {
+        guard.ensure($env, $env->profile, false);
+    }
+    $st = $env->r->run($env->zypper($args));
+    if (in_array($p["cmd"], transactionCommands()) && !$env->r->dry && count(guard.installedBlocked($env, $env->profile)) > 0) {
+        util.warn("w systemie są zastąpione pakiety: " . join(guard.installedBlocked($env, $env->profile), " ") . " (zpm doctor / zpm guard --purge)");
+    }
+    return $st;
+}
+
+func run($argv): int {
+    $p = parse($argv);
+    $cmd = $p["cmd"];
+    if ($cmd === null || $cmd === "help" || in_array("--help", $p["globals"]) && $cmd === null) { usage(); return $cmd === null ? 2 : 0; }
+    if ($cmd === "version") { echo version(); return 0; }
+    $env = makeEnv($p);
+    $rest = $p["rest"];
+    if ($cmd === "profile") { return cmdProfile($env, $rest, $p); }
+    if ($cmd === "guard") { return cmdGuard($env, $rest); }
+    if ($cmd === "unguard") { $r = guard.release($env, $env->profile); util.info("zdjęto blokad: " . count($r["locks"]) . ", atrapa: " . ($r["stub"] ? "usunięta" : "brak")); return 0; }
+    if ($cmd === "stub") { return cmdStub($env, $rest); }
+    if ($cmd === "analyze") { return cmdAnalyze($env, $rest); }
+    if ($cmd === "doctor") { return cmdDoctor($env); }
+    if ($cmd === "config") { echo Toml.encode($env->conf); return 0; }
+    return passThrough($env, $p);
+}
