@@ -1,0 +1,72 @@
+import Std.Os;
+import Workspace.util;
+import Workspace.glob;
+import Workspace.stub;
+
+##
+ * guard — „strażnik” profilu: atrapa Provides + blokady zypper dla zastąpionych pakietów (+ opcjonalnie usunięcie tych, które już są).
+ * Idempotentny: bezpiecznie wołany przed każdą transakcją.
+##
+
+func locksText($env): string {
+    $p = util.inRoot($env->root, "/etc/zypp/locks");
+    return Os.isFile($p) ? Os.readFile($p) : "";
+}
+
+func hasLock($text, $pat): bool {
+    foreach (util.lines($text) as $l) {
+        $t = trim($l);
+        if ($t === "solvable_name: " . $pat) { return true; }
+    }
+    return false;
+}
+
+# nazwy zainstalowanych pakietów pasujących do wzorców blokady (z wyjątkami allow)
+func installedBlocked($env, $profile): array {
+    if (count($profile["block"]) === 0) { return []; }
+    $res = $env->r->capture($env->rpm(["-qa", "--qf", "%{NAME}\\n"]));
+    $out = [];
+    foreach (util.lines($res["stdout"]) as $n) {
+        if ($n === "" || starts_with($n, "zpm-stub-")) { continue; }
+        if (glob.anyOf($profile["block"], $n) && !glob.anyOf($profile["allow"], $n)) { $out[] = $n; }
+    }
+    return sort(util.uniq($out));
+}
+
+##
+ * $purge: usuń już zainstalowane zastąpione pakiety (rpm -e --nodeps) PO zainstalowaniu atrapy, więc baza rpm pozostaje spójna.
+ * Zwraca ["stub" => ..., "locks" => [dodane], "removed" => [..]]
+##
+func ensure($env, $profile, $purge = false): array {
+    $res = ["stub" => "none", "locks" => [], "removed" => []];
+    if (count($profile["block"]) === 0 && !$profile["stub"]) { return $res; }
+    if ($profile["stub"]) { $res["stub"] = stub.ensure($env, $profile); }
+    if ($purge) {
+        $gone = installedBlocked($env, $profile);
+        if (count($gone) > 0) {
+            util.info("usuwam (rpm -e --nodeps): " . join($gone, " "));
+            $env->r->run($env->rpm(["-e", "--nodeps", ...$gone]));
+            $res["removed"] = $gone;
+        }
+    }
+    $text = locksText($env);
+    foreach ($profile["block"] as $pat) {
+        if (hasLock($text, $pat)) { continue; }
+        $st = $env->r->run($env->zypperNI(["addlock", $pat]));
+        if ($st !== 0) { util.warn("nie udało się dodać blokady: " . $pat); } else { $res["locks"][] = $pat; }
+    }
+    return $res;
+}
+
+func release($env, $profile): array {
+    $res = ["locks" => [], "stub" => false];
+    $text = locksText($env);
+    foreach ($profile["block"] as $pat) {
+        if (hasLock($text, $pat)) {
+            $env->r->run($env->zypperNI(["removelock", $pat]));
+            $res["locks"][] = $pat;
+        }
+    }
+    $res["stub"] = stub.remove($env, $profile);
+    return $res;
+}
