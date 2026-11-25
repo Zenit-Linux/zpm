@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Instalacja zpm. Użycie: [DESTDIR=..] [PREFIX=/usr/local] scripts/install.sh [--bundle]
+set -eu
+HERE="$(cd "$(dirname "$0")/.." && pwd)"; PREFIX="${PREFIX:-/usr/local}"; DESTDIR="${DESTDIR:-}"
+if [ "${1:-}" = "--bundle" ] || [ ! -x "$HERE/zpm" ]; then
+    if command -v zsc >/dev/null && command -v zsc0 >/dev/null; then
+        (cd "$HERE" && zsc build src/main.zsharp --emit zbc -o zpm.zbc && zsc0 bundle zpm.zbc -o zpm)
+    fi
+fi
+install -d "$DESTDIR$PREFIX/bin" "$DESTDIR/etc/zpm/profiles.d"
+if [ -x "$HERE/zpm" ]; then install -m 0755 "$HERE/zpm" "$DESTDIR$PREFIX/bin/zpm"
+else
+    install -d "$DESTDIR$PREFIX/share/zpm"; cp -a "$HERE/src" "$HERE/Z#.toml" "$DESTDIR$PREFIX/share/zpm/"
+    printf '#!/bin/sh\nexec zsc0 run %s/share/zpm/src/main.zsharp "$@"\n' "$PREFIX" > "$DESTDIR$PREFIX/bin/zpm"; chmod 0755 "$DESTDIR$PREFIX/bin/zpm"
+fi
+echo "zpm zainstalowany w ${DESTDIR:-/}$PREFIX"
