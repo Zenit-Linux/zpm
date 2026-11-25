@@ -1,0 +1,77 @@
+import Std.Os;
+import Std.Toml;
+import Workspace.util;
+
+##
+ * profiles — opisy „jaki init jest w systemie”. Profil mówi zpm:
+ *   block    — wzorce (glob) pakietów, których zypper nie może instalować (blokady zypper addlock),
+ *   provides — zdolności (capabilities) zgłaszane przez pakiet-atrapę, żeby zależności `Requires: systemd` były spełnione bez systemd,
+ *   stub     — czy budować/instalować atrapę.
+ * Profile własne: /etc/zpm/profiles.d/<nazwa>.toml (pola jak niżej), nadpisują wbudowane o tej samej nazwie.
+##
+
+# zdolności, których wymagają pakiety Tumbleweed od systemd (wersja wysoka: spełnia `systemd >= N`)
+func systemdProvides(): array {
+    return [
+        "systemd = 99999", "systemd-sysvcompat = 99999", "systemd-sysvinit = 99999", "systemd-units = 99999",
+        "systemd-rpm-macros = 99999", "systemd-presets-common-SUSE = 99999",
+        "/usr/bin/systemctl", "/bin/systemctl", "/usr/bin/journalctl", "/usr/bin/systemd-notify", "/usr/bin/loginctl"
+    ];
+}
+
+func systemdBlock(): array { return ["systemd", "systemd-*"]; }
+
+func nosystemd($name, $descr): array {
+    return ["name" => $name, "description" => $descr, "block" => systemdBlock(), "provides" => systemdProvides(), "stub" => true, "allow" => []];
+}
+
+func builtin(): array {
+    return [
+        "systemd" => ["name" => "systemd", "description" => "systemd jako init — zpm niczego nie blokuje ani nie atrapuje", "block" => [], "provides" => [], "stub" => false, "allow" => []],
+        "zenitd" => nosystemd("zenitd", "Zenit Linux: zenitd zamiast systemd (aplety systemctl/journalctl z zenitd)"),
+        "nosystemd" => nosystemd("nosystemd", "dowolny init bez systemd (własny profil bazowy)"),
+        "openrc" => nosystemd("openrc", "OpenRC zamiast systemd"),
+        "runit" => nosystemd("runit", "runit zamiast systemd")
+    ];
+}
+
+func normalize($p, $name): array {
+    $d = ["name" => $name, "description" => "", "block" => [], "provides" => [], "stub" => true, "allow" => []];
+    $o = util.merge($d, $p);
+    $o["name"] = $name;
+    $o["block"] = util.uniq(util.asList($o["block"]));
+    $o["provides"] = util.uniq(util.asList($o["provides"]));
+    $o["allow"] = util.uniq(util.asList($o["allow"]));
+    if (count($o["provides"]) === 0) { $o["stub"] = false; }
+    return $o;
+}
+
+func dirs($root): array {
+    return [util.inRoot($root, "/etc/zpm/profiles.d"), "/usr/share/zpm/profiles.d"];
+}
+
+func loadFile($path) {
+    try { return Toml.decode(Os.readFile($path)); }
+    catch (Exception $e) { util.die($path . ": " . $e->getMessage()); }
+}
+
+func names($root): array {
+    $out = [];
+    foreach (builtin() as $k => $v) { $out[] = $k; }
+    foreach (dirs($root) as $d) {
+        if (!Os.isDir($d)) { continue; }
+        foreach (Os.list($d) as $f) { if (ends_with($f, ".toml")) { $out[] = substr($f, 0, strlen($f) - 5); } }
+    }
+    return sort(util.uniq($out));
+}
+
+func load($name, $root = ""): array {
+    $b = builtin();
+    $found = has_key($b, $name) ? $b[$name] : null;
+    foreach (dirs($root) as $d) {
+        $f = util.pjoin($d, $name . ".toml");
+        if (Os.isFile($f)) { $found = $found === null ? loadFile($f) : util.merge($found, loadFile($f)); break; }
+    }
+    if ($found === null) { util.die("nieznany profil: " . $name . " (zpm profile list)"); }
+    return normalize($found, $name);
+}
